@@ -1,10 +1,11 @@
 from broker.dhan_client import DhanClient
-import inspect
+from pprint import pprint
 
 broker = DhanClient()
 
-print("=" * 60)
-print("OPTION CHAIN SIGNATURE")
-print("=" * 60)
+response = broker.client.expiry_list(
+    under_security_id=13,
+    under_exchange_segment=broker.client.INDEX,
+)
 
-print(inspect.signature(broker.client.option_chain))
+pprint(response)

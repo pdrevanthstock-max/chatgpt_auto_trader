@@ -1,6 +1,6 @@
 """
 Dhan Broker Client
-Compatible with DhanHQ SDK 2.x
+Compatible with DhanHQ SDK 2.2.0
 """
 
 from dhanhq import DhanContext, dhanhq
@@ -35,20 +35,16 @@ class DhanClient:
         return self.client.get_holdings()
 
     def get_expiry_list(self):
-        """
-        NIFTY Security ID = 13
-        Underlying Type = INDEX
-        """
 
-        return self.client.get_expiry_list(
-            underlying_security_id="13",
-            underlying_type="INDEX",
+        return self.client.expiry_list(
+            under_security_id=13,
+            under_exchange_segment=self.client.INDEX,
         )
 
     def get_option_chain(self, expiry):
 
-        return self.client.get_option_chain(
-            underlying_security_id="13",
-            underlying_type="INDEX",
-            expiry_date=expiry,
+        return self.client.option_chain(
+            under_security_id=13,
+            under_exchange_segment=self.client.INDEX,
+            expiry=expiry,
         )

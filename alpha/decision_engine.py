@@ -1,17 +1,23 @@
 """
 Decision Engine
+
+Maps market signal → trade direction.
+
+  BULLISH  → LONG_CE  (buy call option)
+  BEARISH  → LONG_PE  (buy put option)
+  SIDEWAYS → None     (no trade — future strategy)
 """
 
 
 class DecisionEngine:
 
     @staticmethod
-    def decide(pair, candle_signal):
+    def decide(pair, market_signal):
 
         ce = pair["ce"]
         pe = pair["pe"]
 
-        if candle_signal == "BULLISH":
+        if market_signal == "BULLISH":
 
             return {
                 "direction": "LONG_CE",
@@ -19,7 +25,7 @@ class DecisionEngine:
                 "hedge": pe,
             }
 
-        if candle_signal == "BEARISH":
+        if market_signal == "BEARISH":
 
             return {
                 "direction": "LONG_PE",
@@ -27,4 +33,5 @@ class DecisionEngine:
                 "hedge": ce,
             }
 
+        # SIDEWAYS / NEUTRAL / NO_TRADE → skip
         return None

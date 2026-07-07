@@ -1,5 +1,10 @@
 """
 Position Monitor
+
+Updates a live position with the current market price.
+
+Checks ONLY stop-loss — there is no fixed target.
+The trailing stop (in TrailingManager) handles profit exits.
 """
 
 
@@ -15,16 +20,16 @@ class PositionMonitor:
         ) * position["quantity"]
 
         position["current_price"] = current_price
-        position["pnl"] = pnl
+        position["pnl"] = round(pnl, 2)
 
+        # Reset exit reason each cycle
         position["exit_reason"] = None
 
+        # Stop-loss hit
         if current_price <= position["stop_loss"]:
 
             position["exit_reason"] = "STOP_LOSS"
 
-        elif current_price >= position["target"]:
-
-            position["exit_reason"] = "TARGET"
+        # No fixed target check — trailing stop handles exits
 
         return position

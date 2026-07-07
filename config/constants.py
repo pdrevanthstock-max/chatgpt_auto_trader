@@ -29,7 +29,7 @@ LOG_FOLDER = REPORT_FOLDER / "logs"
 # MARKET TIMINGS
 # =====================================================
 
-MARKET_OPEN = "09:30"
+MARKET_OPEN = "09:15"
 
 MARKET_CLOSE = "15:00"
 

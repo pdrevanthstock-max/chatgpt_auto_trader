@@ -15,10 +15,6 @@ class PositionStore:
     @classmethod
     def save(cls, position):
 
-        print("WRITING FILE...")
-        print(position)
-        print("Saving position...")
-
         with open(cls.FILE, "w") as f:
             json.dump(
                 position,

@@ -1,0 +1,18 @@
+{
+  "total_capital": 30000.0,
+  "divergence_min_pct": 1.0,
+  "divergence_max_pct": 1.5,
+  "candle_interval_minutes": 2,
+  "scan_matrix_range": 5,
+  "per_trade_stop_pct": 0.02,
+  "trail_lock_factor": 0.85,
+  "trail_activation_amount": 0.0,
+  "daily_loss_limit_pct": 0.03,
+  "scan_start": "09:30",
+  "scan_end": "15:00",
+  "nifty_lot_size": 25,
+  "execution_mode": "BACKTEST",
+  "scan_interval_seconds": 120,
+  "backtest_from_date": "",
+  "backtest_to_date": ""
+}

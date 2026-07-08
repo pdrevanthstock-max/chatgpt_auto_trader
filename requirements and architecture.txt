@@ -1,0 +1,160 @@
+# AutoTrader — CE/PE Divergence Capture Strategy
+## Requirements & Architecture Specification
+
+**Purpose of this document:** This is the single source of truth for the strategy Revanth wants built. It exists because two prior AI-assisted rebuilds (ChatGPT-based `AutoTrader-alpha`, Antigravity-based `antigravity-alpha`) each independently invented a *different* strategy — a simple single-leg spot-vs-strike directional bot — instead of building this one. Any coding assistant working on this project must implement what is written here, not infer a "reasonable" trading strategy on its own.
+
+If anything in an existing repository contradicts this document, this document wins.
+
+---
+
+## 1. Core Trading Idea
+
+Capture the divergence in percentage price movement between a Nifty ATM Call (CE) and the paired ATM Put (PE), by buying the leg that is moving favorably and holding the other leg as a hedge, then exiting based on defined risk rules — not a fixed profit target.
+
+This is explicitly **not** a simple "spot above strike → buy CE" trend-following bot. That is a different, simpler strategy and must not be substituted for this one.
+
+---
+
+## 2. Two Strategy Modes
+
+### 2.1 Directional Mode (build first)
+
+- Uses a stop-loss.
+- Cancels/exits the hedge leg once the entered leg crosses its target.
+- Uses a trailing stop-loss on the entered leg after it moves favorably.
+- This is the only mode to build and validate before touching Sideways mode.
+
+### 2.2 Sideways Mode (build later — do not start until Directional is backtested and validated)
+
+- Takes small profits repeatedly rather than trailing a single large move.
+- On hitting a small profit target, exits and immediately looks for a new entry.
+- Does not use the same trailing-stop logic as Directional mode.
+- Explicitly deferred — do not let a coding assistant build this "while it's in there," since it changes exit logic in ways that must not leak into Directional mode's code paths.
+
+---
+
+## 3. Trading Window
+
+- No scanning or entries before **09:30 IST** or after **15:00 IST**.
+- Any position still open at 15:00 needs an explicit decision (carry vs. force-flatten) — **not yet decided; ask before building.** Do not assume overnight carry is acceptable; options decay on theta and this was never confirmed.
+
+---
+
+## 4. Entry Logic
+
+1. Every scan cycle, identify the ATM CE/PE pair (or ranked best pair — see open question in §9.1).
+2. Track each leg's percentage price change **since that specific pair was first scanned/discovered** (not since 9:30 open, not since previous close). This is anchor **(a)** as discussed and agreed — pair-discovery-relative, not a fixed daily anchor.
+3. Compute `abs(CE_%change - PE_%change)`.
+4. **Enter a trade only if this value is between 1% and 1.5%.** Below 1%: no signal. Above 1.5%: too divergent already, skip — do not chase.
+5. On entry: buy the leg that is performing better (the "winning" leg). Hold the opposite leg as the hedge — **do not trade the hedge leg**, it is held/tracked, not actively bought/sold at entry.
+6. **Quantity must be identical on both legs.** Never enter 2 lots on one side and 1 on the other. Lot size is derived from capital allocation (see §6), not hardcoded.
+
+---
+
+## 5. Exit Logic
+
+Two independent exit triggers, not one combined number — this was a real point of confusion earlier and must stay separated in code:
+
+### 5.1 Per-trade exit (single position)
+Exit the entered leg if its unrealized loss exceeds **2% of the capital allocated to that one contract** (the entered leg only — not the pair, not the total daily capital).
+
+Example given for calculation purposes only (not the real capital figure): on ₹10,000 allocated to one contract, a 2% trigger = ₹200 max loss on that position before forced exit.
+
+### 5.2 Daily circuit breaker (whole session)
+Stop opening **any new trades** for the rest of the day once cumulative realized + unrealized loss across all trades reaches **3% of total allocated trading capital** (₹30,000 — see §6). This is a portfolio-level breaker, separate from the per-trade 2% trigger, and must be tracked independently (requires summing PnL across all of today's trades, not just checking the current open position).
+
+---
+
+## 6. Capital
+
+- **Total capital allocated to this bot: ₹30,000.** This is a project-specific figure, independent of whatever total balance exists in the actual Dhan broker account — the bot must never use more than this, regardless of account balance.
+- Must be configurable (via UI or config, not hardcoded as a magic number scattered across files) — a prior repo hardcoded `DEFAULT_CAPITAL = 25000` directly in `constants.py`, which is wrong and needs to be an intentional, changeable setting.
+- Position size (lot quantity) is derived from this capital figure, not fixed at an arbitrary number like `75` regardless of capital.
+
+---
+
+## 7. Data & Backtesting
+
+### 7.1 Backtest first — this is the agreed build order
+Do not go to paper or live trading until a backtest has run against real historical data and the divergence idea shows something worth trading. This was explicitly agreed as the starting point.
+
+### 7.2 Data source
+Dhan's `expired_options_data` API (the "rolling option" / expired-options endpoint) provides historical option data. Confirmed working against Revanth's account and subscription.
+
+**Known gotchas, already discovered — do not rediscover these the hard way:**
+
+- **`expiry_code=0` fails** with a server-side "expiryCode is required" error, even though `0` is a valid documented value elsewhere in Dhan's API. **Use `expiry_code=1`** for "nearest expiry" on this specific endpoint. This is a Dhan-side inconsistency (likely a falsy-zero validation bug on their server), not a client bug.
+- **`strike="ATM"` is a rolling relative reference, not a fixed contract.** The actual underlying strike changes day to day as spot moves. A loader must split historical data into **per-day buckets** and never let a % change calculation span a day boundary — otherwise you're silently comparing two different real contracts as if they were one continuous price series.
+- **CE and PE must be fetched as two separate API calls** (`drv_option_type="CALL"` and `"PUT"` separately) — the endpoint does not return both legs in one response. Align by matching `timestamp` arrays after fetching both.
+- Confirmed available: at least 1 month of recent historical data pulls successfully in a single call (Dhan documentation states up to 30 days per call, multi-year history available via repeated calls if needed later).
+
+### 7.3 Backtest scope caveat (important, must be communicated to whoever builds this)
+The historical endpoint only provides *relative-strike* data (ATM, ATM+1, etc.), not a full historical option chain with liquidity/OI/volume ranking. This means a backtest can only approximate "always trade the ATM CE/PE pair" — it **cannot** replicate a live dynamic pair-ranking system (i.e., it can't backtest `PairRankerV2`-style logic that picks the "best" pair from a full ranked chain each cycle, because that historical breadth of data doesn't exist). This is a known, accepted simplification for v1 backtesting — not a bug to "fix."
+
+### 7.4 Anchor comparison (open item, not yet resolved)
+Two possible definitions of "% change" were discussed for the entry signal:
+- **(a) Pair-discovery-relative** — % change since the specific pair was first scanned this cycle. *(Chosen as the first one to backtest, per agreement, mainly because it requires less new code against the existing pair-ranking structure.)*
+- **(b) Fixed-anchor-relative** — % change since a fixed reference point like 9:30 market open.
+
+**Decision made:** build and backtest (a) first. Only build and backtest (b) afterward, on the same historical data, to compare — do not build both simultaneously or add a market-regime switch between them without first seeing which performs better on real data. Do not assume one suits "sideways" and the other suits "directional" markets — that was an untested hypothesis, explicitly not something to design around yet.
+
+---
+
+## 8. Execution Modes Required
+
+Three distinct modes, clearly separated (this is a UI requirement, see §9):
+
+1. **Backtest** — replay historical data, no real-time API calls, no orders.
+2. **Paper trade** — real-time market data, simulated fills, no real money, no real broker orders.
+3. **Live trade** — real money, real Dhan orders. Must require a deliberate, explicit switch — never a default state.
+
+---
+
+## 9. UI Requirements (currently entirely unbuilt in both prior repos — confirmed by code inspection, despite `streamlit` being listed as a dependency in one repo with zero actual UI code)
+
+- **Start / Stop** controls for the entire trading module.
+- Mode selector: Backtest / Paper / Live.
+- **Live view**: current prices, current open position(s) PnL, running total PnL for the day.
+- **Historical view**: PnL by past day (not just today).
+- **Capital setting**: editable in the UI, independent of the actual broker account balance (see §6).
+- A visible/editable control for the divergence "difference" threshold parameters (the 1–1.5% entry band), so these aren't buried in code that Revanth can't read.
+
+### 9.1 Open question — not yet decided, ask before building
+Does the UI need to show/control the pair-ranking logic (which CE/PE pair is currently being watched), or just the currently open position? Not specified yet.
+
+---
+
+## 10. Reporting
+
+- Automatic Excel export of completed trades and P&L statements. Not yet built in either prior repo (confirmed — no `openpyxl`/`xlsxwriter`/`to_excel` usage found anywhere in either codebase).
+
+---
+
+## 11. Deployment / Remote Access
+
+Revanth asked whether this can run as an always-on service reachable from his phone, instead of a terminal script that only runs while his PC is on and awake.
+
+**Guidance given, to carry forward into implementation planning:**
+- Technically possible, but requires either the PC to be always-on and network-reachable (not recommended — port-forwarding a machine holding live broker credentials is a real security risk), **or** deployment to a small always-on cloud VPS (~$5–10/month) with the UI exposed through an authenticated tunnel (e.g., Tailscale, Cloudflare Tunnel) rather than a bare public URL.
+- This is a distinct chunk of infrastructure work, separate from the trading strategy logic. Do not let it get bundled into "just add it to the todo list" as a minor task — it involves real security decisions (credential handling, authentication on the exposed UI) that deserve their own planning pass, ideally after the strategy itself is proven in backtest/paper modes.
+
+---
+
+## 12. Known Bugs / Anti-Patterns From Prior Repos (do not reintroduce these)
+
+These were found by direct code inspection of the two prior AI-built repositories and should inform code review, even though neither repo's actual strategy is being carried forward:
+
+1. **`database/` folder excluded by `.gitignore`** in one repo, which meant `TradeManager`'s imports (`database.position_store`, `database.trade_journal`) pointed at nothing on any fresh clone — a `ModuleNotFoundError` waiting to happen. If a `database/` (or equivalent) folder is used, only ignore the *data files* inside it (`*.json`, `*.db`), never the `.py` source files.
+2. **Signature mismatches between calling code and called function** — e.g., a `TradeManager.update(current_price)` call feeding a raw float into a `PositionManager.update(position, chain)` function expecting a full option-chain dictionary. Verify function signatures match at both call sites and definitions, not just that both exist.
+3. **Missing methods referenced by tests** — e.g., a test calling `client.connect()` when the actual class has no such method (connection happens implicitly in `__init__` instead). Keep test expectations and actual class interfaces in sync.
+4. **Config values that exist but aren't wired in** — e.g., a `constants.py` defining `DEFAULT_STOPLOSS_PERCENT = 0.50` while the actual risk-management class hardcodes a different value (`0.02`) directly, ignoring the constants file entirely. One source of truth per parameter.
+5. **Dead/empty files left in the repo** (0-byte `.py` files with matching names to real modules, e.g. a `broker/position_manager.py` sitting empty alongside a working `alpha/position_manager.py`). These are a real risk for any AI coding assistant, since a file's *existence* at a plausible path can get treated as "this must already be implemented" and lead to either silently skipping needed work or building a real duplicate. Delete dead files rather than leaving them as empty stubs.
+6. **A "hedge" field that's recorded but never actually priced or traded** — storing `hedge_security_id` on a trade record is not the same as implementing hedge-leg logic. If this spec's hedge-leg requirement (§4, point 5) is implemented, it must actually track that leg's price and quantity, not just log its ID.
+
+---
+
+## 13. Explicit Non-Goals (for now)
+
+- Sideways mode — deferred until Directional is backtested and validated (§2.2).
+- Live trading — not until backtest and paper trading both validate the strategy (§7.1, §8).
+- Multi-strategy regime-switching between entry anchors (a) and (b) — not until both have been independently backtested and compared (§7.4).

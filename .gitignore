@@ -3,8 +3,11 @@ __pycache__/
 .env
 *.pyc
 
-# ignore the actual data files, not the code
+# Data files only — NOT the .py source files (§12.1 fix)
 database/*.db
 database/*.json
-reports/csv/
-reports/logs/
+reports/
+cache/
+
+# Config is tracked (it's the user's settings)
+# config.json — intentionally NOT gitignored

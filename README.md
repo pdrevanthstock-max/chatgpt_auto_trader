@@ -1,173 +1,128 @@
-# AutoTrader-alpha
+# AutoTrader v6.0.0
 
-**Automated NIFTY Options Trading System** — Connects to the Dhan broker API to analyze, rank, and trade NIFTY options in real-time.
+**Adaptive Option Pair Divergence Capture System for NIFTY**
+
+AutoTrader v6.0.0 is a strictly modular algorithmic trading system built to capture pricing divergence between NIFTY options contracts. Rather than trying to predict market direction, the system scans the cross-strike options matrix, identifies structural imbalances, and dynamically opens, rotates, and exits hedge pairs in real-time.
 
 ---
 
-## What It Does
+## Architecture & Data Flow
 
-AutoTrader downloads the live NIFTY option chain every 30 seconds, analyzes all CE (Call) and PE (Put) pairs around the ATM strike, ranks them by liquidity/volume/OI/spread quality, determines if the market is BULLISH or BEARISH, and automatically opens, monitors, and closes trades.
+```
+Dhan WebSocket Feed (ticks) 
+  └─► MarketCache (In-Memory Database)
+        ├─► Spot / ATM Strike
+        ├─► Option Chain / Bid-Ask Spreads
+        └─► Greeks / IV Percentiles
+              │
+        ┌─────┴────────────────────────────────────────┐
+        ▼                                              ▼
+  Backtest Replay Engine                       Live / Paper Loop (Stoppable)
+        │                                              │
+        └──────────────┬───────────────────────────────┘
+                       ▼
+             Pair Candidate Generator (ATM ± 10 Strikes)
+                       ▼
+             Liquidity Filter (Volume, OI, and Spreads)
+                       ▼
+             Divergence Velocity Scanner
+                       ▼
+             Entry Signal Gating (2-Conditions check)
+                       ▼
+             Pair Ranker (Projected Net Profit)
+                       ▼
+             Trade Planner & Position Sizer (Nifty lot size = 65)
+                       ▼
+             Execution Validator & serialized FIFO Queue
+                       ▼
+             Executors (Paper Simulation / Broker orders via asyncio)
+```
 
-## Trading Schedule
+---
 
-| Phase | Time (IST) | Behaviour |
-|-------|-----------|-----------|
-| **Pre-Market** | Before 9:15 | System idle, waiting for market open |
-| **Monitoring** | 9:15 – 9:30 | Downloads option chain, observes first-15-min volatility, determines market trend. **No trades placed.** |
-| **Trading** | 9:30 – 15:00 | Executes trades based on trend established during monitoring phase |
-| **Post-Close** | After 15:00 | Stops scanning for new trades; manages existing open positions until they exit |
+## Strategy Rules
 
-## Strategy
+### 1. Market Hours & Timing
+- **Trading Window**: `09:30` to `15:20` IST.
+- **Entry Cutoff**: `15:10` IST (No entries allowed after this).
+- **EOD Flatten**: `15:20` IST (Force close all open positions).
 
-### Directional Trading (Active)
+### 2. Scanning & Candidate Generation
+- **Scope**: ATM ±10 strikes.
+- **Cartesian Space**: 21 CEs × 21 PEs = 441 candidate combinations scanned every cycle.
+- **Liquidity Filter**: Applied *before* candidate building to reject illiquid strikes:
+  - Volume (last 10 candles) ≥ 100 contracts.
+  - Open Interest (OI) ≥ 1000 contracts.
+  - Bid-Ask Spread ≤ ₹0.50 or 2% of mid-price.
 
-> The market is moving in one direction — ride the trend.
+### 3. Entry Signal Conditions
+Both rules must pass simultaneously:
+1. **Divergence Band**: Absolute difference in CE & PE percentage velocity falls within configured band (1% to 5% default, up to 15% via slider).
+2. **Directional Consistency**:
+   - Spot up → CE velocity ≥ PE velocity.
+   - Spot down → PE velocity ≥ CE velocity.
+   - Spot sideways → no bias required.
 
-- **BULLISH** → Buy Call Option (LONG_CE)
-- **BEARISH** → Buy Put Option (LONG_PE)
-- **Stop Loss**: 2% below entry price
-- **Trailing Stop**: Activates at +1% profit, locks in 90% of unrealised gains
-- **No fixed target** — trailing stop handles profit exits
-- **Daily loss cap**: 3% of capital → stops trading for the day
+### 4. Sizing & Lot Size
+- Lot count is calculated dynamically based on capital (default ₹30,000) and combined premium.
+- Lot size is locked to Nifty's contract size: **65**.
 
-### Sideways Trading (Planned — Not Yet Implemented)
+### 5. Exits & Hedge Cut (Directional Phase 2)
+- **Giveback stop**: 10% peak profit giveback trailing rule applied to combined positions.
+- **Dynamic profit target (Sideways only)**: Target scaled by ATM IV percentile (0.04 to 0.06 factor) + round-trip brokerage. Targets scale by 1.5x during the pre-close window (15:00 - 15:20) to handle wider spreads.
+- **Hedge-cut (Directional only)**: Drop the losing leg when combined profit crosses the threshold (₹300 flat if winning leg value < ₹10K; 2.5% of winning value if ≥ ₹10K) and trail the winning leg under Phase 2 single-leg giveback.
 
-> The market is flat — make small profits repeatedly.
+### 6. Rotation Engine
+Positions rotate to higher-scoring pairs if all five criteria are met:
+1. Higher score (hysteresis ≥ +0.30 points to prevent churn).
+2. Faster divergence velocity.
+3. Banked minimum profit floor (Rs 103).
+4. Liquid targets.
+5. Sufficient time remaining (> 60s before EOD).
+- *Cooldown*: Rotated strikes are barred from re-entry for 3 candles.
 
-- Buy small, take 5% profit, exit, re-enter
-- Will be built after directional engine is fully validated
+---
 
-## Quick Start
+## Folder Layout
 
-### Prerequisites
+The codebase has been refactored to align with a strict Separation of Concerns (SoC) model:
 
-- Python 3.10+
-- Dhan trading account with API access
-- NIFTY F&O enabled
+- `core/` — Domain data dataclasses ([models.py](file:///c:/Users/LENOVO/Desktop/New%20folder%20(3)/AutoTrader-alpha/core/models.py)), enums ([enums.py](file:///c:/Users/LENOVO/Desktop/New%20folder%20(3)/AutoTrader-alpha/core/enums.py)), and exception definitions.
+- `config/` — Configuration settings and JSON load/save operations ([settings.py](file:///c:/Users/LENOVO/Desktop/New%20folder%20(3)/AutoTrader-alpha/config/settings.py)).
+- `data/` — Data fetchers and thread-locked cache database ([market_cache.py](file:///c:/Users/LENOVO/Desktop/New%20folder%20(3)/AutoTrader-alpha/data/market_cache.py)).
+- `strategy/` — Single-responsibility strategy files (candidates, liquidity, scanner, entry signals, ranker, decision memory, exit managers, and rotation).
+- `execution/` — Orders, serialized FIFO queue, state crash-recovery.
+- `monitoring/` — Gating health checks for system latency, spreads, memory and CPU usage.
+- `reporting/` — Professional 3-sheet Excel report builders.
+- `ui/` — Interactive dashboard control panel with Start/Stop controls.
+- `tests/` — Component-level unit test suites.
 
-### Setup
+---
 
+## How to Get Started
+
+### 1. Requirements Installation
+Ensure Python 3.10+ is installed, then run:
 ```bash
-# Clone the repository
-git clone https://github.com/pdrevanthstock-max/AutoTrader-alpha.git
-cd AutoTrader-alpha
-
-# Create virtual environment
-python -m venv venv
-venv\Scripts\activate       # Windows
-source venv/bin/activate    # macOS/Linux
-
-# Install dependencies
 pip install -r requirements.txt
 ```
 
-### Configuration
-
-Create a `.env` file in the project root:
-
+### 2. Configure Credentials
+Add your Dhan API details to the `.env` file in the project root:
 ```env
-DHAN_CLIENT_ID=your_client_id
-DHAN_ACCESS_TOKEN=your_access_token
+DHAN_CLIENT_ID=your_id
+DHAN_ACCESS_TOKEN=your_token
 ```
 
-### Run
-
+### 3. Launch App Dashboard
+Run the command launcher from your terminal:
 ```bash
-# Paper trading (default — no real orders)
-python -m engine.trading_scheduler
-
-# Or run the scheduler directly
-python -c "from engine.trading_scheduler import TradingScheduler; TradingScheduler().start()"
+python -m streamlit run ui/app.py
 ```
+Or double-click [run_app.bat](file:///c:/Users/LENOVO/Desktop/New%20folder%20(3)/AutoTrader-alpha/run_app.bat) (on Windows).
 
-### Run Tests
-
+### 4. Run Test Suite
+Validate strategy math and queue routines:
 ```bash
-python -m tests.test_exit_flow
-python -m tests.test_position_lifecycle
-python -m tests.test_trading_engine
+python -m pytest tests/ -v
 ```
-
-## Project Structure
-
-```
-AutoTrader-alpha/
-├── alpha/                    # Intelligence Pipeline (Signal Generation)
-│   ├── option_chain.py       # Downloads live NIFTY option chain from Dhan
-│   ├── strike_selector.py    # Finds ATM strike and creates strike window
-│   ├── dynamic_window.py     # Auto-expands window until enough valid pairs
-│   ├── pair_generator.py     # Creates all CE/PE pair combinations
-│   ├── liquidity_filter.py   # Removes illiquid options
-│   ├── feature_extractor.py  # Extracts distance, OI, volume, spread, Greeks
-│   ├── market_statistics.py  # Calculates min/max for normalization
-│   ├── normalized_scorer.py  # Scores each pair 0-1 across features
-│   ├── pair_ranker_v2.py     # Ranks all pairs by composite score
-│   ├── market_confirmation.py# Determines BULLISH/BEARISH/SIDEWAYS from spot vs strikes
-│   ├── decision_engine.py    # Maps market signal → trade direction
-│   ├── trade_planner.py      # Builds complete trade plan with security IDs
-│   ├── paper_executor.py     # Simulates order fill for paper trading
-│   ├── broker_executor.py    # Places real orders through Dhan API (inactive)
-│   └── market_state.py       # Stores recent market observations
-│
-├── engine/                   # Execution Engine (Trade Management)
-│   ├── trading_engine.py     # Runs one complete scan + trade cycle
-│   ├── trading_scheduler.py  # Runs engine continuously during market hours
-│   ├── trade_manager.py      # Maintains one active paper position
-│   ├── position_decision.py  # Decides ENTRY / HOLD / REVERSE
-│   ├── execution_manager.py  # Routes to Paper or Live executor
-│   ├── risk_manager.py       # Applies 2% SL, trailing on
-│   ├── position_monitor.py   # Updates PnL, checks stop-loss triggers
-│   ├── trailing_manager.py   # Ratchets stop-loss upward after +1% profit
-│   ├── exit_manager.py       # Finalises position, calculates final PnL
-│   └── price_lookup.py       # Finds current option price by security_id
-│
-├── database/                 # Data Persistence
-│   ├── position_store.py     # Saves/loads current_position.json
-│   └── trade_journal.py      # Appends completed trades to trade_history.json
-│
-├── analytics/                # Post-Trade Analysis
-│   └── trade_statistics.py   # Win/loss rate, net PnL summary
-│
-├── broker/                   # Broker Integration
-│   ├── dhan_client.py        # Dhan API client wrapper
-│   ├── broker_interface.py   # Abstract broker interface
-│   └── market_data.py        # Market data fetcher
-│
-├── config/                   # Configuration
-│   ├── constants.py          # Market hours, paths, trading params
-│   └── settings.py           # App name, version
-│
-├── tests/                    # Test Suite
-│   ├── test_exit_flow.py     # Stop-loss and trailing exit tests
-│   ├── test_position_lifecycle.py # Full trade lifecycle test
-│   └── ...                   # Module-level unit tests
-│
-├── .env                      # API credentials (git-ignored)
-├── .gitignore
-├── requirements.txt
-└── README.md
-```
-
-## Risk Management
-
-| Parameter | Value |
-|-----------|-------|
-| Per-trade stop loss | 2% |
-| Trailing activation | +1% profit |
-| Trailing lock-in | 90% of unrealised gains |
-| Daily loss cap | 3% of capital |
-| Max open positions | 1 |
-| Default capital | ₹25,000 |
-
-## Execution Modes
-
-| Mode | Status | Description |
-|------|--------|-------------|
-| **PAPER** | ✅ Active | Simulated order fills — no real money |
-| **LIVE** | ⚠️ Coded, not active | Real Dhan API orders — requires manual switch |
-
-To switch to live mode, set `ExecutionManager.MODE = "LIVE"` in `engine/execution_manager.py`. **Only do this after thorough backtesting and paper trading validation.**
-
-## License
-
-Private repository. All rights reserved.

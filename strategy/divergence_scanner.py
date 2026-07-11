@@ -1,103 +1,48 @@
-"""
-Divergence Scanner
-───────────────────
-Core signal engine: computes per-candle velocity divergence
-between CE and PE legs.
+import logging
+from typing import List, Tuple, Any
+from data.market_cache import market_cache
+from core.models import CandidatePair
 
-User's specification (refined from §4):
-  Velocity_CE = ((Close_CE - Open_CE) / Open_CE) * 100
-  Velocity_PE = ((Close_PE - Open_PE) / Open_PE) * 100
-  Divergence  = |Velocity_CE - Velocity_PE|
-
-This is the heart of the strategy. Everything else is plumbing.
-"""
-
-from __future__ import annotations
-
-from typing import List, Optional
-
-from core.models import PairedCandle, VelocityResult
-from core.enums import MarketSignal
-
+logger = logging.getLogger("AutoTrader")
 
 class DivergenceScanner:
     """
-    Scans paired CE/PE candles and computes velocity divergence.
-    Stateless — each call is independent.
+    Computes per-candle percentage velocity for both legs of each candidate pair.
     """
+    def scan_candidates(self, candidates: List[Tuple[Any, Any]]) -> List[CandidatePair]:
+        chain = market_cache.get_option_chain()
+        pairs = []
 
-    @staticmethod
-    def compute_velocity(candle: PairedCandle) -> VelocityResult:
-        """
-        Compute intra-candle percentage velocity for both legs.
+        for ce_strike, pe_strike in candidates:
+            ce_data = chain.get(ce_strike, {}).get("CE")
+            pe_data = chain.get(pe_strike, {}).get("PE")
 
-        Velocity = ((Close - Open) / Open) * 100
+            if not ce_data or not pe_data:
+                continue
 
-        This measures how much each leg moved within a single candle,
-        NOT cumulative since some anchor point.
-        """
-        # Guard against division by zero (pre-market or zero-price candles)
-        if candle.ce_open <= 0 or candle.pe_open <= 0:
-            return VelocityResult(
-                timestamp=candle.timestamp,
-                strike=candle.strike,
-                ce_velocity=0.0,
-                pe_velocity=0.0,
-                divergence=0.0,
-                winning_leg="NONE",
-            )
+            ce_open = ce_data.get("open", 0.0)
+            ce_close = ce_data.get("last", ce_data.get("close", 0.0))  # use last/close
 
-        ce_vel = ((candle.ce_close - candle.ce_open) / candle.ce_open) * 100
-        pe_vel = ((candle.pe_close - candle.pe_open) / candle.pe_open) * 100
+            pe_open = pe_data.get("open", 0.0)
+            pe_close = pe_data.get("last", pe_data.get("close", 0.0))
 
-        divergence = abs(ce_vel - pe_vel)
+            # Protect against division by zero
+            if ce_open <= 0.0 or pe_open <= 0.0:
+                continue
 
-        # Winning leg = the one with higher absolute velocity
-        # For entry direction: positive CE velocity → bullish, positive PE velocity → bearish
-        # But we compare absolute movement to find which leg is "winning"
-        if abs(ce_vel) > abs(pe_vel):
-            winning_leg = "CE"
-        elif abs(pe_vel) > abs(ce_vel):
-            winning_leg = "PE"
-        else:
-            winning_leg = "NONE"
+            ce_velocity = ((ce_close - ce_open) / ce_open) * 100.0
+            pe_velocity = ((pe_close - pe_open) / pe_open) * 100.0
+            divergence = abs(ce_velocity - pe_velocity)
+            
+            winning_leg = "CE" if ce_velocity >= pe_velocity else "PE"
 
-        return VelocityResult(
-            timestamp=candle.timestamp,
-            strike=candle.strike,
-            ce_velocity=round(ce_vel, 4),
-            pe_velocity=round(pe_vel, 4),
-            divergence=round(divergence, 4),
-            winning_leg=winning_leg,
-        )
+            pairs.append(CandidatePair(
+                ce_strike=ce_strike,
+                pe_strike=pe_strike,
+                ce_velocity=round(ce_velocity, 4),
+                pe_velocity=round(pe_velocity, 4),
+                divergence=round(divergence, 4),
+                winning_leg=winning_leg
+            ))
 
-    @staticmethod
-    def determine_signal(velocity: VelocityResult) -> MarketSignal:
-        """
-        Determine market direction from velocity result.
-
-        User clarification:
-          - CE velocity winning (CE moving up more) → BULLISH → buy CE, hedge PE
-          - PE velocity winning (PE moving up more) → BEARISH → buy PE, hedge CE
-        """
-        if velocity.winning_leg == "CE":
-            # CE is performing better → bullish signal
-            if velocity.ce_velocity > 0:
-                return MarketSignal.BULLISH
-            # CE is falling less than PE → still relatively bullish
-            return MarketSignal.BULLISH
-
-        if velocity.winning_leg == "PE":
-            # PE is performing better → bearish signal
-            if velocity.pe_velocity > 0:
-                return MarketSignal.BEARISH
-            return MarketSignal.BEARISH
-
-        return MarketSignal.NO_SIGNAL
-
-    @classmethod
-    def scan_candles(
-        cls, candles: List[PairedCandle]
-    ) -> List[VelocityResult]:
-        """Compute velocity for a sequence of candles."""
-        return [cls.compute_velocity(c) for c in candles]
+        return pairs

@@ -1,1 +1,1 @@
-# tests — unit tests for strategy components
+# Tests package initialization

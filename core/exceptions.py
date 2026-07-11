@@ -1,35 +1,31 @@
-"""
-Domain Exceptions
-──────────────────
-Specific, catchable exceptions instead of bare RuntimeError.
-"""
-
-
-class AutoTraderError(Exception):
+class AutoTraderException(Exception):
     """Base exception for all AutoTrader errors."""
     pass
 
-
-class DataFetchError(AutoTraderError):
-    """Failed to fetch data from Dhan API."""
+class PartialFillError(AutoTraderException):
+    """Raised when only one leg of a basket order is filled within the timeout."""
     pass
 
-
-class InsufficientDataError(AutoTraderError):
-    """Not enough data points to compute signals."""
+class BrokerConnectionError(AutoTraderException):
+    """Raised when connection to broker fails or times out."""
     pass
 
-
-class CircuitBreakerTriggered(AutoTraderError):
-    """§5.2: Daily loss limit reached. No more trades today."""
+class HealthCheckFailure(AutoTraderException):
+    """Raised when system health monitor checks fail, gating entry."""
     pass
 
-
-class ConfigurationError(AutoTraderError):
-    """Invalid or missing configuration."""
+class StaleDataError(AutoTraderException):
+    """Raised when the MarketCache data is too old."""
     pass
 
+class InsufficientDataError(AutoTraderException):
+    """Raised when there is not enough historical or live data to process."""
+    pass
 
-class InvalidTradeError(AutoTraderError):
-    """Trade violates a business rule (e.g., unequal leg quantities)."""
+class DataFetchError(AutoTraderException):
+    """Raised when data fetching from the Dhan API fails."""
+    pass
+
+class CircuitBreakerTriggered(AutoTraderException):
+    """Raised when daily loss limit is hit and new trades are blocked."""
     pass

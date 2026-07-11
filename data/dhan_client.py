@@ -1,167 +1,91 @@
-"""
-Dhan API Client
-────────────────
-Thin wrapper around DhanHQ SDK 2.2.0.
-Handles only the API calls this system actually uses.
-
-§7.2 gotchas are encoded here:
-  - expiry_code=1 (not 0)
-  - CE and PE fetched separately
-  - strike="ATM" is a rolling reference
-"""
-
-from __future__ import annotations
-
 import time
-from typing import Dict, Any, Optional
-
-from loguru import logger
-
+import logging
+from typing import Dict, Any, List
+from dhanhq import DhanContext, dhanhq
 from config.settings import DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN
-from core.exceptions import DataFetchError, ConfigurationError
+from core.exceptions import DataFetchError
 
+logger = logging.getLogger("AutoTrader")
 
 class DhanClient:
-    """
-    Minimal Dhan API client.
-    Only exposes methods this project actually uses.
-    """
+    """Wrapper around Dhan SDK with retry logic and error handling."""
+    MAX_RETRIES = 5
+    RETRY_BASE_DELAY = 1.0
 
-    # Retry config for rate limiting (§Beyond the Scope #3)
-    MAX_RETRIES = 3
-    RETRY_BASE_DELAY = 2.0  # seconds, doubles each retry
-
-    def __init__(self):
+    def __init__(self) -> None:
         if not DHAN_CLIENT_ID or not DHAN_ACCESS_TOKEN:
-            raise ConfigurationError(
-                "DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN must be set in .env"
-            )
-
-        from dhanhq import DhanContext, dhanhq
-
-        self._context = DhanContext(DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN)
-        self._client = dhanhq(self._context)
-        logger.info("Dhan client initialized")
+            logger.warning("DHAN_CLIENT_ID or DHAN_ACCESS_TOKEN not set in environment.")
+        
+        # Initialize context and client
+        self.ctx = DhanContext(client_id=DHAN_CLIENT_ID, access_token=DHAN_ACCESS_TOKEN)
+        self.client = dhanhq(self.ctx)
+        logger.info("Dhan client wrapper initialized")
 
     def get_expired_options_data(
         self,
-        option_type: str,         # "CALL" or "PUT"
-        from_date: str,           # "YYYY-MM-DD"
-        to_date: str,             # "YYYY-MM-DD"
-        strike: str = "ATM",      # "ATM", "ATM+1", etc.
-        interval: int = 1,        # minutes: 1, 5, 15, 25, 60
-        expiry_code: int = 1,     # §7.2: MUST be 1, not 0
-        security_id: int = 13,    # 13 = NIFTY
+        option_type: str,
+        from_date: str,
+        to_date: str,
+        strike: str,
+        security_id: str = "13",  # default NIFTY
+        expiry_flag: str = "WEEK",
+        expiry_code: int = 1,
+        interval: int = 1,
     ) -> Dict[str, Any]:
         """
-        Fetch historical option candle data via Dhan's rolling-option endpoint.
-
-        §7.2 known gotchas applied:
-          - expiry_code=1 always (0 causes server error)
-          - option_type must be "CALL" or "PUT" (no combined fetch)
-          - strike="ATM" is relative, changes daily
-
-        Returns raw API response dict with OHLCV + IV + OI data.
+        Fetch historical expired options data.
         """
         if option_type not in ("CALL", "PUT"):
-            raise DataFetchError(
-                f"option_type must be 'CALL' or 'PUT', got '{option_type}'"
-            )
-
-        payload = {
-            "exchangeSegment": "NSE_FNO",
-            "instrument": "OPTIDX",
-            "securityId": str(security_id),
-            "expiryFlag": "MONTH",
-            "expiryCode": expiry_code,
-            "strike": strike,
-            "drvOptionType": option_type,
-            "interval": interval,
-            "fromDate": from_date,
-            "toDate": to_date,
-            "requiredData": ["open", "high", "low", "close", "volume"],
-        }
-
-        return self._request_with_retry(payload)
-
-    def get_option_chain(self, expiry: str) -> Dict[str, Any]:
-        """Fetch live option chain (for paper/live trading later)."""
-        return self._client.option_chain(
-            under_security_id=13,
-            under_exchange_segment=self._client.INDEX,
-            expiry=expiry,
-        )
-
-    def get_expiry_list(self) -> Dict[str, Any]:
-        """Fetch available expiry dates for NIFTY options."""
-        return self._client.expiry_list(
-            under_security_id=13,
-            under_exchange_segment=self._client.INDEX,
-        )
-
-    def _request_with_retry(self, payload: Dict) -> Dict[str, Any]:
-        """
-        POST to rolling-option endpoint with exponential backoff.
-        Dhan has undocumented rate limits — this prevents silent failures.
-        """
-        last_error: Optional[Exception] = None
+            raise DataFetchError(f"option_type must be 'CALL' or 'PUT', got {option_type}")
 
         for attempt in range(self.MAX_RETRIES):
             try:
-                # The dhanhq SDK's internal method for this endpoint
-                response = self._client.historical_minute_charts(
-                    symbol="",
+                response = self.client.expired_options_data(
+                    security_id=security_id,
                     exchange_segment="NSE_FNO",
                     instrument_type="OPTIDX",
-                    expiry_code=payload["expiryCode"],
-                    from_date=payload["fromDate"],
-                    to_date=payload["toDate"],
+                    expiry_flag=expiry_flag,
+                    expiry_code=expiry_code,
+                    strike=strike,
+                    drv_option_type=option_type,
+                    required_data=["open", "high", "low", "close", "volume"],
+                    from_date=from_date,
+                    to_date=to_date,
+                    interval=interval,
                 )
-
-                # If SDK doesn't have the direct method, fall back to raw POST
                 if response is None:
-                    raise DataFetchError("SDK returned None")
-
+                    raise DataFetchError("SDK returned None response")
                 return response
-
-            except AttributeError:
-                # SDK version may not have this method — use raw request
-                import requests
-
-                url = "https://api.dhan.co/v2/charts/rollingoption"
-                headers = {
-                    "Content-Type": "application/json",
-                    "access-token": DHAN_ACCESS_TOKEN,
-                }
-
-                resp = requests.post(url, json=payload, headers=headers, timeout=30)
-
-                if resp.status_code == 200:
-                    return resp.json()
-                elif resp.status_code == 429:
-                    # Rate limited
-                    delay = self.RETRY_BASE_DELAY * (2 ** attempt)
-                    logger.warning(
-                        f"Rate limited (429). Retrying in {delay}s "
-                        f"(attempt {attempt + 1}/{self.MAX_RETRIES})"
-                    )
-                    time.sleep(delay)
-                    last_error = DataFetchError(f"Rate limited: {resp.text}")
-                    continue
-                else:
-                    raise DataFetchError(
-                        f"Dhan API error {resp.status_code}: {resp.text}"
-                    )
-
             except Exception as e:
                 delay = self.RETRY_BASE_DELAY * (2 ** attempt)
                 logger.warning(
-                    f"API request failed: {e}. "
-                    f"Retrying in {delay}s (attempt {attempt + 1}/{self.MAX_RETRIES})"
+                    f"Dhan API call failed on attempt {attempt+1}/{self.MAX_RETRIES}: {e}. "
+                    f"Retrying in {delay}s..."
                 )
                 time.sleep(delay)
-                last_error = e
 
-        raise DataFetchError(
-            f"Failed after {self.MAX_RETRIES} retries. Last error: {last_error}"
-        )
+        raise DataFetchError(f"Failed to fetch options data after {self.MAX_RETRIES} attempts.")
+
+    def place_order(self, order_details: Dict[str, Any]) -> str:
+        """Place live order on Dhan. Returns order ID."""
+        try:
+            # Structurally valid live order placement
+            # Using order placement structure from Dhan API
+            resp = self.client.place_order(**order_details)
+            if resp.get("status") == "success":
+                return resp.get("data", {}).get("orderId", "")
+            else:
+                raise DataFetchError(f"Order placement failed: {resp}")
+        except Exception as e:
+            raise DataFetchError(f"Failed to place order: {e}")
+
+    def get_positions(self) -> List[Dict[str, Any]]:
+        """Fetch open positions from broker."""
+        try:
+            resp = self.client.get_positions()
+            if resp.get("status") == "success":
+                return resp.get("data", [])
+            return []
+        except Exception as e:
+            logger.error(f"Failed to fetch live positions: {e}")
+            return []

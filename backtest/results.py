@@ -1,156 +1,77 @@
-"""
-Backtest Results
-─────────────────
-Collects trade results, computes statistics, and prepares
-data for reporting and UI display.
-"""
-
-from __future__ import annotations
-
-from dataclasses import dataclass, field
+import logging
 from datetime import datetime
-from typing import List, Dict, Optional
+from typing import List, Dict, Any
+from core.models import Trade
 
-from core.models import Trade, DaySession
+logger = logging.getLogger("AutoTrader")
 
-
-@dataclass
 class BacktestResults:
     """
-    Aggregated backtest results across all trading days.
-    Fed into reporting/excel_export and UI display.
+    Collects execution statistics from a backtest run.
     """
-    sessions: List[DaySession] = field(default_factory=list)
-    config_snapshot: Dict = field(default_factory=dict)
-    start_date: Optional[datetime] = None
-    end_date: Optional[datetime] = None
+    def __init__(self, trades: List[Trade], initial_capital: float) -> None:
+        self.trades = trades
+        self.initial_capital = initial_capital
+        self.total_trades = len(trades)
 
-    def add_session(self, session: DaySession) -> None:
-        """Add a completed day session."""
-        self.sessions.append(session)
+    def calculate_metrics(self) -> Dict[str, Any]:
+        if not self.trades:
+            return {
+                "total_trades": 0,
+                "total_pnl": 0.0,
+                "win_rate": 0.0,
+                "wins": 0,
+                "losses": 0,
+                "net_profit_pct": 0.0,
+                "max_drawdown": 0.0,
+                "profit_factor": 0.0
+            }
 
-    @property
-    def all_trades(self) -> List[Trade]:
-        """Flatten all trades from all sessions."""
-        trades = []
-        for session in self.sessions:
-            trades.extend(session.trades)
-        return trades
+        total_pnl = sum(t.combined_pnl for t in self.trades)
+        wins = [t for t in self.trades if t.combined_pnl > 0]
+        losses = [t for t in self.trades if t.combined_pnl <= 0]
+        
+        win_rate = (len(wins) / self.total_trades) * 100.0 if self.total_trades > 0 else 0.0
 
-    @property
-    def closed_trades(self) -> List[Trade]:
-        """Only completed (exited) trades."""
-        return [t for t in self.all_trades if not t.is_open]
+        gross_profit = sum(t.combined_pnl for t in wins)
+        gross_loss = abs(sum(t.combined_pnl for t in losses))
+        profit_factor = gross_profit / gross_loss if gross_loss > 0 else (gross_profit if gross_profit > 0 else 1.0)
 
-    @property
-    def total_trades(self) -> int:
-        return len(self.closed_trades)
-
-    @property
-    def winning_trades(self) -> int:
-        return sum(1 for t in self.closed_trades if t.combined_pnl > 0)
-
-    @property
-    def losing_trades(self) -> int:
-        return sum(1 for t in self.closed_trades if t.combined_pnl < 0)
-
-    @property
-    def win_rate(self) -> float:
-        if self.total_trades == 0:
-            return 0.0
-        return round(self.winning_trades / self.total_trades * 100, 2)
-
-    @property
-    def total_pnl(self) -> float:
-        return round(sum(t.combined_pnl for t in self.closed_trades), 2)
-
-    @property
-    def max_drawdown(self) -> float:
-        """Maximum peak-to-trough decline in cumulative PnL."""
-        if not self.closed_trades:
-            return 0.0
-
-        cumulative = 0.0
-        peak = 0.0
+        # Calculate max drawdown in rupee terms
+        equity = self.initial_capital
+        peak = self.initial_capital
         max_dd = 0.0
-
-        for trade in self.closed_trades:
-            cumulative += trade.combined_pnl
-            if cumulative > peak:
-                peak = cumulative
-            dd = peak - cumulative
+        
+        # Sort trades by exit time to trace equity curve
+        sorted_trades = sorted(self.trades, key=lambda x: x.exit_time or datetime.now())
+        for t in sorted_trades:
+            equity += t.combined_pnl
+            if equity > peak:
+                peak = equity
+            dd = peak - equity
             if dd > max_dd:
                 max_dd = dd
 
-        return round(max_dd, 2)
-
-    @property
-    def avg_profit(self) -> float:
-        winners = [t.combined_pnl for t in self.closed_trades if t.combined_pnl > 0]
-        if not winners:
-            return 0.0
-        return round(sum(winners) / len(winners), 2)
-
-    @property
-    def avg_loss(self) -> float:
-        losers = [t.combined_pnl for t in self.closed_trades if t.combined_pnl < 0]
-        if not losers:
-            return 0.0
-        return round(sum(losers) / len(losers), 2)
-
-    @property
-    def profit_factor(self) -> float:
-        """Ratio of gross profit to gross loss."""
-        gross_profit = sum(t.combined_pnl for t in self.closed_trades if t.combined_pnl > 0)
-        gross_loss = abs(sum(t.combined_pnl for t in self.closed_trades if t.combined_pnl < 0))
-        if gross_loss == 0:
-            return float("inf") if gross_profit > 0 else 0.0
-        return round(gross_profit / gross_loss, 2)
-
-    @property
-    def circuit_breaker_days(self) -> int:
-        """Number of days where the circuit breaker was hit."""
-        return sum(1 for s in self.sessions if s.circuit_breaker_hit)
-
-    @property
-    def daily_pnl(self) -> List[Dict]:
-        """PnL broken down by day — for the history page."""
-        result = []
-        for session in self.sessions:
-            result.append({
-                "date": session.date,
-                "trades": session.trade_count,
-                "realized_pnl": session.realized_pnl,
-                "circuit_breaker": session.circuit_breaker_hit,
-            })
-        return result
-
-    @property
-    def equity_curve(self) -> List[Dict]:
-        """Cumulative PnL over time — for charting."""
-        points = []
-        cumulative = 0.0
-        for trade in self.closed_trades:
-            cumulative += trade.combined_pnl
-            points.append({
-                "time": trade.exit_time,
-                "pnl": round(cumulative, 2),
-                "trade_id": trade.id,
-            })
-        return points
-
-    def summary(self) -> Dict:
-        """Generate a summary dict for UI/reporting."""
         return {
             "total_trades": self.total_trades,
-            "winning_trades": self.winning_trades,
-            "losing_trades": self.losing_trades,
-            "win_rate": f"{self.win_rate}%",
-            "total_pnl": f"₹{self.total_pnl:,.2f}",
-            "avg_profit": f"₹{self.avg_profit:,.2f}",
-            "avg_loss": f"₹{self.avg_loss:,.2f}",
-            "max_drawdown": f"₹{self.max_drawdown:,.2f}",
-            "profit_factor": self.profit_factor,
-            "circuit_breaker_days": self.circuit_breaker_days,
-            "trading_days": len(self.sessions),
+            "total_pnl": round(total_pnl, 2),
+            "win_rate": round(win_rate, 2),
+            "wins": len(wins),
+            "losses": len(losses),
+            "net_profit_pct": round((total_pnl / self.initial_capital) * 100.0, 2),
+            "max_drawdown": round(max_dd, 2),
+            "profit_factor": round(profit_factor, 2)
         }
+
+    def summary(self) -> str:
+        metrics = self.calculate_metrics()
+        return (
+            f"--- Backtest Summary ---\n"
+            f"Total Trades: {metrics['total_trades']}\n"
+            f"Total PnL: ₹{metrics['total_pnl']:,.2f} ({metrics['net_profit_pct']}%)\n"
+            f"Win Rate: {metrics['win_rate']}%\n"
+            f"Wins: {metrics['wins']} | Losses: {metrics['losses']}\n"
+            f"Profit Factor: {metrics['profit_factor']}\n"
+            f"Max Drawdown: ₹{metrics['max_drawdown']:,.2f}\n"
+            f"------------------------"
+        )

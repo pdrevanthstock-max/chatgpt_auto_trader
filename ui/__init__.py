@@ -1,1 +1,1 @@
-# ui — Streamlit web interface
+# UI package initialization

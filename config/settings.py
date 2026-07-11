@@ -1,28 +1,12 @@
-"""
-Application Settings — Single Source of Truth
-───────────────────────────────────────────────
-§6: All configurable parameters live here.
-     No constants.py, no magic numbers scattered across files.
-
-Secrets (.env):       DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN
-Trading params:       config.json (UI-editable)
-Everything else:      Derived from the above two sources.
-"""
-
 from __future__ import annotations
 
 import json
 import os
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-
 from dotenv import load_dotenv
 
 load_dotenv()
-
-# ─────────────────────────────────────────────
-# Paths
-# ─────────────────────────────────────────────
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_FILE = PROJECT_ROOT / "config.json"
@@ -30,75 +14,72 @@ DATABASE_DIR = PROJECT_ROOT / "database"
 REPORTS_DIR = PROJECT_ROOT / "reports"
 CACHE_DIR = PROJECT_ROOT / "cache"
 
-# Ensure directories exist
 DATABASE_DIR.mkdir(exist_ok=True)
 REPORTS_DIR.mkdir(exist_ok=True)
 CACHE_DIR.mkdir(exist_ok=True)
 
-# ─────────────────────────────────────────────
-# Secrets (from .env only — never in config.json)
-# ─────────────────────────────────────────────
-
 DHAN_CLIENT_ID: str = os.getenv("DHAN_CLIENT_ID", "")
 DHAN_ACCESS_TOKEN: str = os.getenv("DHAN_ACCESS_TOKEN", "")
 
-
-# ─────────────────────────────────────────────
-# Trading Configuration (UI-editable)
-# ─────────────────────────────────────────────
-
 @dataclass
 class TradingConfig:
-    """
-    Every tunable parameter in the system.
-    Saved to / loaded from config.json.
-    UI edits this, code reads this. One source of truth.
-    """
+    # Capital
+    total_capital: float = 30000.0
 
-    # ── Capital (§6) ──
-    total_capital: float = 30_000.0
+    # Option specs
+    nifty_lot_size: int = 65
+    pair_scan_range: int = 10  # ATM ± N strikes (default 10)
+    candle_interval_minutes: int = 2
 
-    # ── Entry Signal (§4 / user's velocity approach) ──
-    divergence_min_pct: float = 1.0     # lower band of entry window
-    divergence_max_pct: float = 1.5     # upper band of entry window
-    candle_interval_minutes: int = 2    # aggregate 1-min into N-min candles
-    scan_matrix_range: int = 5          # ATM ± N strikes (5-10, per user)
+    # Entry criteria
+    divergence_band_min: float = 1.0   # % change divergence lower band
+    divergence_band_max: float = 5.0   # % change divergence upper band
 
-    # ── Per-trade exit (§5.1) ──
-    per_trade_stop_pct: float = 0.02    # 2% of allocated capital
+    # Exit parameters (Phase 1)
+    giveback_pct: float = 0.10          # 10% giveback of peak profits
 
-    # ── Trailing stop (§2.1 / user: 85% lock-in) ──
-    trail_lock_factor: float = 0.85     # lock 85% of peak profit
-    trail_activation_amount: float = 0.0  # activate trailing after any profit (0 = immediate)
+    # Hedge-cut parameters (Directional only)
+    hedge_cut_threshold_flat: float = 300.0   # Flat Rs if winning leg value < 10000
+    hedge_cut_threshold_pct: float = 0.025    # 2.5% of winning leg value if >= 10000
+    hedge_cut_value_breakpoint: float = 10000.0
 
-    # ── Daily circuit breaker (§5.2) ──
-    daily_loss_limit_pct: float = 0.03  # 3% of total capital
+    # Risk Management
+    daily_loss_limit_pct: float = 0.03        # 3% of capital
 
-    # ── Trading window (§3) ──
-    scan_start: str = "09:30"           # IST, no trades before this
-    scan_end: str = "15:00"             # IST, force-flatten at this time
+    # Trading Hours (IST)
+    scan_start: str = "09:30"
+    scan_end: str = "15:20"
+    last_entry_time: str = "15:10"
 
-    # ── Position sizing (§6) ──
-    nifty_lot_size: int = 25            # Nifty options lot size
+    # Rotation parameters
+    rotation_min_profit_floor: float = 103.0   # Minimum banked net profit
+    rotation_score_hysteresis: float = 0.30    # Re-entry requires +0.30 score improvement
+    rotation_cooldown_candles: int = 3         # Cooldown in candles before re-entering same pair
 
-    # ── Execution mode (§8) ──
-    execution_mode: str = "BACKTEST"    # BACKTEST | PAPER | LIVE
+    # IV Target Scaling (Sideways only)
+    iv_percentile_low: int = 20
+    iv_percentile_high: int = 80
 
-    # ── Scan interval (for paper/live) ──
+    # Pre-close window scaling
+    preclose_window_start: str = "15:00"
+    preclose_entry_cutoff: str = "15:10"
+
+    # Health Checks
+    health_check_api_latency_ms: int = 500
+    health_check_spread_max: float = 1.50
+    health_check_cache_stale_sec: int = 1
+
+    # App controls
+    execution_mode: str = "BACKTEST"  # BACKTEST | PAPER | LIVE
     scan_interval_seconds: int = 120
-
-    # ── Backtest date range ──
     backtest_from_date: str = ""
     backtest_to_date: str = ""
 
-    # ── Derived (not saved) ──
     @property
     def daily_loss_limit(self) -> float:
-        """Absolute ₹ amount for circuit breaker."""
         return self.total_capital * self.daily_loss_limit_pct
 
     def save(self, path: Path = None) -> None:
-        """Persist config to JSON."""
         path = path or CONFIG_FILE
         data = asdict(self)
         with open(path, "w", encoding="utf-8") as f:
@@ -106,7 +87,6 @@ class TradingConfig:
 
     @classmethod
     def load(cls, path: Path = None) -> TradingConfig:
-        """Load config from JSON, falling back to defaults for missing keys."""
         path = path or CONFIG_FILE
         if not path.exists():
             config = cls()
@@ -116,15 +96,9 @@ class TradingConfig:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
 
-        # Only accept known fields (forward-compatible)
         known_fields = {f.name for f in cls.__dataclass_fields__.values()}
         filtered = {k: v for k, v in data.items() if k in known_fields}
         return cls(**filtered)
 
-
-# ─────────────────────────────────────────────
-# App Metadata
-# ─────────────────────────────────────────────
-
 APP_NAME = "AutoTrader"
-APP_VERSION = "3.0.0"  # Major version bump: complete strategy rewrite
+APP_VERSION = "6.0.0"

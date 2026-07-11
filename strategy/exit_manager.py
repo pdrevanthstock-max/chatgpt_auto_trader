@@ -1,185 +1,73 @@
-"""
-Exit Manager
-──────────────
-Handles ALL exit logic for Directional mode.
-
-Two INDEPENDENT exit triggers (§5 — must stay separated in code):
-  1. Per-trade stop: 2% of capital allocated to that trade (§5.1)
-  2. Trailing stop: 85% lock-in of peak combined PnL (user feedback)
-
-Plus:
-  3. EOD flatten: Force-close at 15:00 IST (§3, Option A confirmed)
-
-Daily circuit breaker (§5.2) is handled separately in daily_circuit_breaker.py.
-"""
-
-from __future__ import annotations
-
+import logging
 from typing import Optional
-from datetime import time as dtime
-
-from loguru import logger
-
 from core.models import Trade
-from core.enums import ExitReason, TradeDirection
+from core.enums import ExitReason, MarketRegime, TradePhase
 from config.settings import TradingConfig
 
+logger = logging.getLogger("AutoTrader")
 
 class ExitManager:
     """
-    Checks exit conditions on an open trade.
-    Each check is independent — a trade can be exited by any trigger.
+    Manages exits for combined positions (Phase 1 — both legs open).
+    Tracks peak profit and checks for 10% giveback and dynamic IV-scaled profit targets.
     """
-
-    @staticmethod
-    def check_per_trade_stop(
+    def check_exits(
+        self,
         trade: Trade,
-        config: TradingConfig,
+        ce_price: float,
+        pe_price: float,
+        iv_percentile: float,
+        is_preclose: bool,
+        config: TradingConfig
     ) -> Optional[ExitReason]:
-        """
-        §5.1: Exit if unrealized loss exceeds 2% of the capital
-        allocated to THIS trade.
+        if trade.phase != TradePhase.PHASE_1_BOTH_LEGS:
+            return None
 
-        Note: "capital allocated to that one contract" = trade.capital_allocated.
-        The 2% is of that allocation, not of total capital.
+        # Update prices
+        trade.ce_current_price = ce_price
+        trade.pe_current_price = pe_price
+
+        current_pnl = trade.combined_pnl
         
-        Combined PnL is used because both legs are actually bought (§4.5 confirmed).
-        """
-        combined_pnl = trade.combined_pnl
-        loss_limit = trade.capital_allocated * config.per_trade_stop_pct
+        # Track peak profit (only track if PnL is positive to avoid immediate triggering)
+        if current_pnl > 0.0:
+            trade.peak_combined_pnl = max(trade.peak_combined_pnl, current_pnl)
 
-        if combined_pnl < 0 and abs(combined_pnl) >= loss_limit:
-            logger.warning(
-                f"PER-TRADE STOP: Combined PnL ₹{combined_pnl:.2f} "
-                f"exceeds 2% limit of ₹{loss_limit:.2f}"
-            )
-            return ExitReason.PER_TRADE_STOP
-
-        return None
-
-    @staticmethod
-    def update_trailing_stop(
-        trade: Trade,
-        config: TradingConfig,
-    ) -> Trade:
-        """
-        §2.1 + User feedback: Trailing stop with 85% lock-in.
-
-        User example: "if we get profits 100rs it should put stop loss at 85"
-        → lock_factor = 0.85, so trailing_stop = peak_pnl × 0.85
-
-        Logic:
-          1. Track peak combined PnL
-          2. trailing_stop_pnl = peak × lock_factor
-          3. Trailing stop only moves UP, never down
-          4. When combined PnL drops below trailing_stop_pnl → EXIT
-
-        User: "the trailing stop loss should always need to be updated
-               automatically based on the market"
-        → This runs on EVERY scan cycle while position is open.
-        """
-        combined_pnl = trade.combined_pnl
-
-        # Update peak if new high
-        if combined_pnl > trade.peak_combined_pnl:
-            trade.peak_combined_pnl = combined_pnl
-
-            # Update trailing stop level
-            new_trailing = combined_pnl * config.trail_lock_factor
-            if new_trailing > trade.trailing_stop_pnl:
-                trade.trailing_stop_pnl = new_trailing
-                logger.debug(
-                    f"Trailing stop updated: peak=₹{combined_pnl:.2f}, "
-                    f"stop=₹{new_trailing:.2f}"
+        # 1. 10% Peak-Profit Giveback Rule
+        # Fired in all regimes during Phase 1
+        if trade.peak_combined_pnl > 0.0:
+            # If current PnL drops below 90% of the peak profit
+            giveback_threshold = trade.peak_combined_pnl * (1.0 - config.giveback_pct)
+            if current_pnl < giveback_threshold:
+                logger.warning(
+                    f"ExitManager (GIVEBACK): Current combined PnL ₹{current_pnl:.2f} "
+                    f"fell below 90% of peak ₹{trade.peak_combined_pnl:.2f} (threshold: ₹{giveback_threshold:.2f})."
                 )
+                return ExitReason.GIVEBACK
 
-        return trade
+        # 2. Dynamic Profit Target Rule (Sideways regime only)
+        # In sideways mode, we check for a dynamic target hit
+        if trade.regime_at_entry == MarketRegime.SIDEWAYS:
+            # Calculate scaling factor based on IV percentile
+            if iv_percentile < config.iv_percentile_low:
+                scaling_factor = 0.04
+            elif iv_percentile > config.iv_percentile_high:
+                scaling_factor = 0.06
+            else:
+                scaling_factor = 0.05
 
-    @staticmethod
-    def check_trailing_stop(
-        trade: Trade,
-        config: TradingConfig,
-    ) -> Optional[ExitReason]:
-        """
-        Check if trailing stop has been hit.
+            combined_entry_premium = (trade.entry_ce_price + trade.entry_pe_price) * trade.quantity * trade.lot_size
+            profit_target = 103.0 + (combined_entry_premium * scaling_factor) + 8.0
 
-        Only triggers if:
-          1. There has been some profit (peak > 0)
-          2. Current PnL has fallen below the trailing stop level
+            # Scale up during preclose window (15:00 - 15:20) by 1.5x
+            if is_preclose:
+                profit_target *= 1.5
 
-        User feedback: "if there is movement the market instead going upside
-        if goes downside it can book profits... once we enter into market and
-        it started going sideways it can book the profits"
-        """
-        # No trailing stop if we've never been in profit
-        if trade.peak_combined_pnl <= 0:
-            return None
-
-        # No trailing stop level set yet
-        if trade.trailing_stop_pnl <= 0:
-            return None
-
-        combined_pnl = trade.combined_pnl
-
-        # Trailing stop hit: PnL dropped below locked level
-        if combined_pnl <= trade.trailing_stop_pnl:
-            logger.warning(
-                f"TRAILING STOP: PnL ₹{combined_pnl:.2f} fell below "
-                f"trailing stop ₹{trade.trailing_stop_pnl:.2f} "
-                f"(peak was ₹{trade.peak_combined_pnl:.2f})"
-            )
-            return ExitReason.TRAILING_STOP
-
-        return None
-
-    @staticmethod
-    def check_eod_flatten(
-        current_time: dtime,
-        config: TradingConfig,
-    ) -> Optional[ExitReason]:
-        """
-        §3 (Option A confirmed): Force-flatten at 15:00 IST.
-        No overnight carry for options (theta decay risk).
-        """
-        end_hour, end_minute = map(int, config.scan_end.split(":"))
-        end_time = dtime(end_hour, end_minute)
-
-        if current_time >= end_time:
-            logger.info("EOD FLATTEN: Market close reached, forcing exit")
-            return ExitReason.EOD_FLATTEN
-
-        return None
-
-    @classmethod
-    def check_all_exits(
-        cls,
-        trade: Trade,
-        current_time: dtime,
-        config: TradingConfig,
-    ) -> Optional[ExitReason]:
-        """
-        Run all exit checks in priority order.
-        Returns the first triggered ExitReason, or None.
-
-        Priority:
-          1. EOD flatten (time-based, non-negotiable)
-          2. Per-trade stop (capital protection)
-          3. Trailing stop (profit protection)
-        """
-        # 1. EOD check
-        reason = cls.check_eod_flatten(current_time, config)
-        if reason:
-            return reason
-
-        # 2. Per-trade stop
-        reason = cls.check_per_trade_stop(trade, config)
-        if reason:
-            return reason
-
-        # 3. Update trailing and check
-        cls.update_trailing_stop(trade, config)
-        reason = cls.check_trailing_stop(trade, config)
-        if reason:
-            return reason
+            if current_pnl >= profit_target:
+                logger.info(
+                    f"ExitManager (TARGET_HIT): Combined PnL ₹{current_pnl:.2f} reached "
+                    f"dynamic target of ₹{profit_target:.2f}."
+                )
+                return ExitReason.TARGET_HIT
 
         return None

@@ -1,44 +1,26 @@
-"""
-Domain Models
-──────────────
-Immutable dataclasses for all domain objects.
-These are the data contracts between layers — no logic here.
-"""
-
 from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Optional, List
-
-from core.enums import TradeDirection, ExitReason
-
-
-# ─────────────────────────────────────────────
-# Market Data
-# ─────────────────────────────────────────────
+from typing import Optional, List, Dict, Any
+from core.enums import TradeDirection, ExitReason, MarketRegime, TradePhase, OrderType, SignalType
 
 @dataclass(frozen=True)
 class Candle:
-    """A single OHLCV candle (1-min or aggregated)."""
+    """A single OHLCV candle."""
     timestamp: datetime
     open: float
     high: float
     low: float
     close: float
     volume: int = 0
-    oi: int = 0  # open interest
-
+    oi: int = 0
 
 @dataclass(frozen=True)
 class PairedCandle:
-    """
-    Aligned CE + PE candle at the same timestamp and strike.
-    This is the atomic unit for velocity calculations.
-    """
+    """Aligned CE + PE candle at the same timestamp."""
     timestamp: datetime
-    strike: int
     ce_open: float
     ce_high: float
     ce_low: float
@@ -50,84 +32,77 @@ class PairedCandle:
     pe_close: float
     pe_volume: int
 
-
 @dataclass
 class DayBucket:
-    """
-    §7.2 gotcha #2: One trading day's aligned CE+PE candle data.
-    % change calculations must NEVER span a day boundary.
-    """
+    """A single trading day's aligned CE+PE candle data for a strike pair."""
     date: datetime
-    strike: int
+    strike_ce: int
+    strike_pe: int
     candles: List[PairedCandle] = field(default_factory=list)
 
     @property
     def is_empty(self) -> bool:
         return len(self.candles) == 0
 
-
-# ─────────────────────────────────────────────
-# Signal / Scanning
-# ─────────────────────────────────────────────
-
 @dataclass(frozen=True)
-class VelocityResult:
-    """Per-candle velocity calculation for a CE/PE pair."""
-    timestamp: datetime
-    strike: int
-    ce_velocity: float       # ((Close - Open) / Open) * 100
-    pe_velocity: float       # ((Close - Open) / Open) * 100
-    divergence: float        # abs(ce_velocity - pe_velocity)
-    winning_leg: str         # "CE" or "PE" — the leg with better performance
-
-
-@dataclass(frozen=True)
-class EntrySignal:
-    """A confirmed entry signal that passed the 1–1.5% filter."""
-    timestamp: datetime
-    strike: int
-    direction: TradeDirection
-    divergence: float
+class CandidatePair:
+    """A generated CE x PE candidate pair before scoring."""
+    ce_strike: int
+    pe_strike: int
     ce_velocity: float
     pe_velocity: float
-    ce_price: float          # current CE price at signal time
-    pe_price: float          # current PE price at signal time
+    divergence: float
+    winning_leg: str  # "CE" or "PE"
 
+@dataclass(frozen=True)
+class ScoredCandidate:
+    """A candidate pair with projected net profit and confidence score."""
+    ce_strike: int
+    pe_strike: int
+    ce_velocity: float
+    pe_velocity: float
+    divergence: float
+    winning_leg: str
+    projected_net_profit: float
+    confidence: float
 
-# ─────────────────────────────────────────────
-# Trade / Position
-# ─────────────────────────────────────────────
+@dataclass
+class TradePlan:
+    """Assembled trade details before entry order execution."""
+    scored_candidate: ScoredCandidate
+    regime: MarketRegime
+    order_type: OrderType
+    quantity: int
+    lot_size: int = 65
+    ce_limit_price: Optional[float] = None
+    pe_limit_price: Optional[float] = None
 
 @dataclass
 class Trade:
-    """
-    A complete trade record (open or closed).
-
-    §4.5 confirmed: BOTH legs are actually bought (2-contract basket).
-    §4.6: Quantity is identical on both legs.
-    """
+    """Tracks the lifecycle of an active or closed trade."""
     id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
-
-    # Direction
     direction: TradeDirection = TradeDirection.LONG_CE
-
-    # Entry
+    strike_ce: int = 0
+    strike_pe: int = 0
     entry_ce_price: float = 0.0
     entry_pe_price: float = 0.0
-    quantity: int = 0           # lot quantity, identical for both legs
-    lot_size: int = 25          # Nifty lot size
+    quantity: int = 0
+    lot_size: int = 65
     entry_time: Optional[datetime] = None
-    strike: int = 0
-
-    # Capital allocation (§5.1: 2% stop is relative to THIS)
-    capital_allocated: float = 0.0
-
-    # Current state (updated each scan cycle)
-    current_ce_price: float = 0.0
-    current_pe_price: float = 0.0
-    peak_combined_pnl: float = 0.0   # highest PnL seen (for trailing)
-    trailing_stop_pnl: float = 0.0   # trailing stop level in PnL terms
-
+    regime_at_entry: MarketRegime = MarketRegime.SIDEWAYS
+    phase: TradePhase = TradePhase.PHASE_1_BOTH_LEGS
+    
+    # State tracking
+    ce_current_price: float = 0.0
+    pe_current_price: float = 0.0
+    peak_combined_pnl: float = 0.0
+    peak_single_leg_pnl: float = 0.0
+    
+    # Phase transition (hedge cut)
+    hedge_cut_time: Optional[datetime] = None
+    losing_leg_exit_price: Optional[float] = None
+    losing_leg_pnl: float = 0.0
+    
     # Exit
     exit_ce_price: Optional[float] = None
     exit_pe_price: Optional[float] = None
@@ -136,67 +111,64 @@ class Trade:
 
     @property
     def is_open(self) -> bool:
-        return self.exit_time is None
+        return self.phase != TradePhase.CLOSED
 
     @property
-    def entry_leg_price(self) -> float:
-        """The entry price of the primary (winning) leg."""
+    def winning_leg(self) -> str:
         if self.direction == TradeDirection.LONG_CE:
-            return self.entry_ce_price
-        return self.entry_pe_price
+            return "CE"
+        return "PE"
 
     @property
-    def hedge_leg_price(self) -> float:
-        """The entry price of the hedge leg."""
+    def losing_leg(self) -> str:
         if self.direction == TradeDirection.LONG_CE:
-            return self.entry_pe_price
-        return self.entry_ce_price
+            return "PE"
+        return "CE"
 
     @property
-    def current_entry_leg_price(self) -> float:
-        """Current price of the primary leg."""
-        if self.direction == TradeDirection.LONG_CE:
-            return self.current_ce_price
-        return self.current_pe_price
+    def entry_winning_price(self) -> float:
+        return self.entry_ce_price if self.winning_leg == "CE" else self.entry_pe_price
 
     @property
-    def current_hedge_leg_price(self) -> float:
-        """Current price of the hedge leg."""
-        if self.direction == TradeDirection.LONG_CE:
-            return self.current_pe_price
-        return self.current_ce_price
+    def entry_losing_price(self) -> float:
+        return self.entry_pe_price if self.winning_leg == "CE" else self.entry_ce_price
 
     @property
-    def total_contracts(self) -> int:
-        """Total number of individual contracts (quantity × lot_size × 2 legs)."""
-        return self.quantity * self.lot_size * 2
+    def current_winning_price(self) -> float:
+        return self.ce_current_price if self.winning_leg == "CE" else self.pe_current_price
+
+    @property
+    def current_losing_price(self) -> float:
+        return self.pe_current_price if self.winning_leg == "CE" else self.ce_current_price
+
+    @property
+    def exit_winning_price(self) -> Optional[float]:
+        return self.exit_ce_price if self.winning_leg == "CE" else self.exit_pe_price
+
+    @property
+    def exit_losing_price(self) -> Optional[float]:
+        return self.exit_pe_price if self.winning_leg == "CE" else self.exit_ce_price
 
     @property
     def combined_pnl(self) -> float:
-        """
-        Combined PnL across both legs.
-        Both legs are bought, so PnL = (current - entry) × qty × lot_size for each.
-        """
-        if not self.is_open and self.exit_ce_price is not None:
-            ce_pnl = (self.exit_ce_price - self.entry_ce_price) * self.quantity * self.lot_size
-            pe_pnl = (self.exit_pe_price - self.entry_pe_price) * self.quantity * self.lot_size
-        else:
-            ce_pnl = (self.current_ce_price - self.entry_ce_price) * self.quantity * self.lot_size
-            pe_pnl = (self.current_pe_price - self.entry_pe_price) * self.quantity * self.lot_size
-        return round(ce_pnl + pe_pnl, 2)
-
-    @property
-    def entry_leg_pnl(self) -> float:
-        """PnL on the entry (primary) leg only."""
-        price_diff = self.current_entry_leg_price - self.entry_leg_price
-        return round(price_diff * self.quantity * self.lot_size, 2)
-
-    @property
-    def hedge_leg_pnl(self) -> float:
-        """PnL on the hedge leg only."""
-        price_diff = self.current_hedge_leg_price - self.hedge_leg_price
-        return round(price_diff * self.quantity * self.lot_size, 2)
-
+        if self.phase == TradePhase.PHASE_1_BOTH_LEGS:
+            ce_p = (self.ce_current_price - self.entry_ce_price) * self.quantity * self.lot_size
+            pe_p = (self.pe_current_price - self.entry_pe_price) * self.quantity * self.lot_size
+            return round(ce_p + pe_p, 2)
+        elif self.phase == TradePhase.PHASE_2_SINGLE_LEG:
+            winning_p = (self.current_winning_price - self.entry_winning_price) * self.quantity * self.lot_size
+            return round(self.losing_leg_pnl + winning_p, 2)
+        else:  # CLOSED
+            if self.losing_leg_exit_price is not None:
+                w_exit = self.exit_winning_price if self.exit_winning_price is not None else self.current_winning_price
+                winning_p = (w_exit - self.entry_winning_price) * self.quantity * self.lot_size
+                return round(self.losing_leg_pnl + winning_p, 2)
+            else:
+                ce_ex = self.exit_ce_price if self.exit_ce_price is not None else self.ce_current_price
+                pe_ex = self.exit_pe_price if self.exit_pe_price is not None else self.pe_current_price
+                ce_p = (ce_ex - self.entry_ce_price) * self.quantity * self.lot_size
+                pe_p = (pe_ex - self.entry_pe_price) * self.quantity * self.lot_size
+                return round(ce_p + pe_p, 2)
 
 @dataclass
 class DaySession:
@@ -229,5 +201,13 @@ class DaySession:
         return round(self.realized_pnl + self.unrealized_pnl, 2)
 
     def close_trade(self, trade: Trade) -> None:
-        """Record a closed trade's PnL into realized."""
         self.realized_pnl = round(self.realized_pnl + trade.combined_pnl, 2)
+
+@dataclass
+class ExecutionSignal:
+    """FIFO queue signal package."""
+    type: SignalType
+    timestamp: datetime = field(default_factory=datetime.now)
+    trade_id: Optional[str] = None
+    trade_plan: Optional[TradePlan] = None
+    reason: Optional[str] = None

@@ -1,1 +1,1 @@
-# backtest — historical replay engine
+# Backtest package initialization

@@ -1,114 +1,93 @@
-"""
-Simulated Fill
-───────────────
-For backtest mode: simulates order fills without real broker interaction.
-v1: instant fill at close price (no slippage model).
-
-Future enhancement: add configurable slippage (fixed-tick or percentage).
-"""
-
-from __future__ import annotations
-
+import logging
 from datetime import datetime
-from typing import Optional
+from core.models import TradePlan, Trade, PairedCandle
+from core.enums import TradeDirection, ExitReason, TradePhase, OrderType
+from core.exceptions import PartialFillError
 
-from loguru import logger
-
-from core.models import Trade, EntrySignal
-from core.enums import TradeDirection, ExitReason
-from config.settings import TradingConfig
-from strategy.position_sizer import PositionSizer
-
+logger = logging.getLogger("AutoTrader")
 
 class SimulatedFill:
     """
-    Creates Trade objects from entry signals using simulated fills.
-    Both legs are bought simultaneously (2-contract basket).
+    Simulates entry and exit order fills for backtesting,
+    including limit order price checks against high/low ranges.
     """
+    def fill_entry(self, plan: TradePlan, candle: PairedCandle) -> Trade:
+        # Check limit price touches in backtest
+        if plan.order_type == OrderType.LIMIT:
+            ce_ok = candle.ce_low <= plan.ce_limit_price <= candle.ce_high
+            pe_ok = candle.pe_low <= plan.pe_limit_price <= candle.pe_high
+            
+            if not ce_ok or not pe_ok:
+                raise PartialFillError("Limit prices did not touch the candle high/low range.")
+                
+            ce_price = plan.ce_limit_price
+            pe_price = plan.pe_limit_price
+        else:
+            # Market order fills at the open price of the N+1 candle
+            # (which is the current candle in the replay loop)
+            ce_price = candle.ce_open
+            pe_price = candle.pe_open
 
-    @staticmethod
-    def fill_entry(
-        signal: EntrySignal,
-        config: TradingConfig,
-    ) -> Optional[Trade]:
-        """
-        Simulate filling a 2-contract basket entry.
-
-        §4.5 confirmed: both CE and PE are actually bought.
-        §4.6: quantity is identical on both legs.
-
-        Returns a Trade object, or None if sizing fails.
-        """
-        # Calculate position size from capital
-        quantity = PositionSizer.calculate_quantity(
-            ce_price=signal.ce_price,
-            pe_price=signal.pe_price,
-            config=config,
-        )
-
-        if quantity <= 0:
-            logger.warning(
-                f"Cannot fill entry: insufficient capital for "
-                f"CE={signal.ce_price}, PE={signal.pe_price}"
-            )
-            return None
-
-        # Calculate capital allocated to this trade (for §5.1 stop)
-        capital_allocated = PositionSizer.calculate_capital_per_trade(
-            ce_price=signal.ce_price,
-            pe_price=signal.pe_price,
-            quantity=quantity,
-            config=config,
-        )
+        direction = TradeDirection.LONG_CE if plan.scored_candidate.winning_leg == "CE" else TradeDirection.LONG_PE
 
         trade = Trade(
-            direction=signal.direction,
-            entry_ce_price=signal.ce_price,
-            entry_pe_price=signal.pe_price,
-            quantity=quantity,
-            lot_size=config.nifty_lot_size,
-            entry_time=signal.timestamp,
-            strike=signal.strike,
-            capital_allocated=capital_allocated,
-            current_ce_price=signal.ce_price,
-            current_pe_price=signal.pe_price,
-            peak_combined_pnl=0.0,
-            trailing_stop_pnl=0.0,
+            direction=direction,
+            strike_ce=plan.scored_candidate.ce_strike,
+            strike_pe=plan.scored_candidate.pe_strike,
+            entry_ce_price=ce_price,
+            entry_pe_price=pe_price,
+            quantity=plan.quantity,
+            lot_size=plan.lot_size,
+            entry_time=candle.timestamp,
+            regime_at_entry=plan.regime,
+            phase=TradePhase.PHASE_1_BOTH_LEGS,
+            ce_current_price=ce_price,
+            pe_current_price=pe_price
         )
-
-        logger.info(
-            f"ENTRY FILLED: {signal.direction.value} | "
-            f"CE=₹{signal.ce_price:.2f} PE=₹{signal.pe_price:.2f} | "
-            f"Qty={quantity} lots | "
-            f"Capital=₹{capital_allocated:.2f} | "
-            f"Divergence={signal.divergence:.2f}%"
-        )
-
         return trade
 
-    @staticmethod
-    def fill_exit(
-        trade: Trade,
-        ce_price: float,
-        pe_price: float,
-        exit_time: datetime,
-        reason: ExitReason,
-    ) -> Trade:
-        """
-        Simulate filling an exit on both legs.
-        Updates the trade with exit prices and reason.
-        """
-        trade.exit_ce_price = ce_price
-        trade.exit_pe_price = pe_price
-        trade.exit_time = exit_time
+    def fill_exit_both(self, trade: Trade, candle: PairedCandle, reason: ExitReason) -> None:
+        # Exit fills at the current candle close (or open if EOD square-off)
+        ce_exit = candle.ce_close
+        pe_exit = candle.pe_close
+
+        trade.exit_ce_price = ce_exit
+        trade.exit_pe_price = pe_exit
+        trade.exit_time = candle.timestamp
         trade.exit_reason = reason
+        trade.phase = TradePhase.CLOSED
 
-        pnl = trade.combined_pnl
+    def fill_hedge_cut(self, trade: Trade, candle: PairedCandle) -> None:
+        losing_leg = trade.losing_leg
+        losing_exit = candle.pe_close if losing_leg == "PE" else candle.ce_close
+        entry_price = trade.entry_pe_price if losing_leg == "PE" else trade.entry_ce_price
+        
+        losing_leg_pnl = (losing_exit - entry_price) * trade.quantity * trade.lot_size
 
-        logger.info(
-            f"EXIT FILLED: {reason.value} | "
-            f"CE exit=₹{ce_price:.2f} PE exit=₹{pe_price:.2f} | "
-            f"PnL=₹{pnl:.2f}"
-        )
+        trade.hedge_cut_time = candle.timestamp
+        trade.losing_leg_exit_price = losing_exit
+        trade.losing_leg_pnl = round(losing_leg_pnl, 2)
 
-        return trade
+        if losing_leg == "PE":
+            trade.exit_pe_price = losing_exit
+            trade.pe_current_price = losing_exit
+        else:
+            trade.exit_ce_price = losing_exit
+            trade.ce_current_price = losing_exit
+
+        trade.phase = TradePhase.PHASE_2_SINGLE_LEG
+
+    def fill_single_leg_exit(self, trade: Trade, candle: PairedCandle, reason: ExitReason) -> None:
+        winning_leg = trade.winning_leg
+        winning_exit = candle.ce_close if winning_leg == "CE" else candle.pe_close
+
+        if winning_leg == "CE":
+            trade.exit_ce_price = winning_exit
+            trade.ce_current_price = winning_exit
+        else:
+            trade.exit_pe_price = winning_exit
+            trade.pe_current_price = winning_exit
+
+        trade.exit_time = candle.timestamp
+        trade.exit_reason = reason
+        trade.phase = TradePhase.CLOSED

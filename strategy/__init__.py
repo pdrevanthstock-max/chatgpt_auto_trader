@@ -1,1 +1,1 @@
-# strategy — CE/PE divergence capture logic
+# Strategy package initialization

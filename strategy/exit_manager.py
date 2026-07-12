@@ -68,6 +68,7 @@ class ExitManager:
                     f"ExitManager (TARGET_HIT): Combined PnL ₹{current_pnl:.2f} reached "
                     f"dynamic target of ₹{profit_target:.2f}."
                 )
+                trade.target_pnl = profit_target
                 return ExitReason.TARGET_HIT
 
         return None

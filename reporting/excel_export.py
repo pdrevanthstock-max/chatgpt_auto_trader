@@ -51,7 +51,9 @@ class ExcelExporter:
         ws_summary.row_dimensions[1].height = 40
 
         # Calculations
-        total_pnl = sum(t.combined_pnl for t in trades)
+        total_gross_pnl = sum(t.combined_pnl for t in trades)
+        total_costs = sum(t.transaction_costs for t in trades)
+        total_net_pnl = sum(t.net_pnl for t in trades)
         win_trades = [t for t in trades if t.combined_pnl > 0]
         loss_trades = [t for t in trades if t.combined_pnl <= 0]
         win_rate = (len(win_trades) / len(trades)) * 100.0 if trades else 0.0
@@ -69,7 +71,9 @@ class ExcelExporter:
             ("Gross Profit", f"₹{gross_profit:,.2f}", ""),
             ("Gross Loss", f"₹{gross_loss:,.2f}", ""),
             ("Profit Factor", f"{profit_factor:.2f}", ""),
-            ("Net Profit/Loss", f"₹{total_pnl:,.2f}", "")
+            ("Total Gross P&L", f"₹{total_gross_pnl:,.2f}", ""),
+            ("Transaction Costs", f"₹{total_costs:,.2f}", ""),
+            ("Net Profit/Loss", f"₹{total_net_pnl:,.2f}", "")
         ]
 
         for r_idx, row in enumerate(metrics, start=3):
@@ -86,9 +90,9 @@ class ExcelExporter:
                         cell.font = regular_font
                     
                     # Highlight Net Profit cell
-                    if r_idx == 11 and c_idx == 2:
+                    if r_idx == 13 and c_idx == 2:
                         cell.font = bold_font
-                        cell.fill = green_fill if total_pnl >= 0 else red_fill
+                        cell.fill = green_fill if total_net_pnl >= 0 else red_fill
 
         ws_summary.column_dimensions["A"].width = 25
         ws_summary.column_dimensions["B"].width = 20
@@ -103,7 +107,8 @@ class ExcelExporter:
             "Trade ID", "Direction", "CE Strike", "PE Strike", 
             "CE Entry", "PE Entry", "Entry Price (Combined)", "Qty (Lots)", "Lot Size", 
             "Regime", "Phase", "Hedge Cut Time", "Losing Leg Exit", "Losing Leg PnL", 
-            "CE Exit", "PE Exit", "Exit Price (Combined)", "Exit Time", "Exit Reason", "Net PnL"
+            "CE Exit", "PE Exit", "Exit Price (Combined)", "Exit Time", "Exit Reason", 
+            "Gross PnL", "Transaction Costs", "Net PnL"
         ]
 
         for col_idx, h in enumerate(headers, start=1):
@@ -137,7 +142,9 @@ class ExcelExporter:
                 combined_exit if t.exit_time else "N/A",
                 t.exit_time.strftime("%Y-%m-%d %H:%M:%S") if t.exit_time else "N/A",
                 t.exit_reason.value if t.exit_reason else "OPEN",
-                t.combined_pnl
+                t.combined_pnl,
+                t.transaction_costs,
+                t.net_pnl
             ]
 
             for c_idx, val in enumerate(row_data, start=1):
@@ -145,14 +152,14 @@ class ExcelExporter:
                 cell.font = regular_font
                 
                 # Format numbers
-                if c_idx in [5, 6, 7, 13, 14, 15, 16, 17, 20]:
+                if c_idx in [5, 6, 7, 13, 14, 15, 16, 17, 20, 21, 22]:
                     if isinstance(val, (int, float)):
                         cell.number_format = '"₹"#,##0.00'
                 
                 # Color Net PnL green/red
-                if c_idx == 20:
+                if c_idx == 22:
                     cell.font = bold_font
-                    cell.fill = green_fill if t.combined_pnl >= 0 else red_fill
+                    cell.fill = green_fill if t.net_pnl >= 0 else red_fill
 
         # Auto-adjust column widths
         for col in ws_journal.columns:
@@ -166,7 +173,7 @@ class ExcelExporter:
         ws_daily = wb.create_sheet(title="Daily Summary")
         ws_daily.views.sheetView[0].showGridLines = True
 
-        daily_headers = ["Date", "Trades Count", "Realized PnL"]
+        daily_headers = ["Date", "Trades Count", "Gross PnL", "Transaction Costs", "Net PnL"]
         for col_idx, h in enumerate(daily_headers, start=1):
             cell = ws_daily.cell(row=1, column=col_idx, value=h)
             cell.font = header_font
@@ -184,19 +191,31 @@ class ExcelExporter:
 
         for r_idx, d_str in enumerate(sorted(daily_trades.keys()), start=2):
             day_trades = daily_trades[d_str]
-            day_pnl = sum(t.combined_pnl for t in day_trades)
+            day_gross = sum(t.combined_pnl for t in day_trades)
+            day_costs = sum(t.transaction_costs for t in day_trades)
+            day_net = sum(t.net_pnl for t in day_trades)
 
             ws_daily.cell(row=r_idx, column=1, value=d_str).font = regular_font
             ws_daily.cell(row=r_idx, column=2, value=len(day_trades)).font = regular_font
             
-            pnl_cell = ws_daily.cell(row=r_idx, column=3, value=day_pnl)
-            pnl_cell.font = bold_font
-            pnl_cell.number_format = '"₹"#,##0.00'
-            pnl_cell.fill = green_fill if day_pnl >= 0 else red_fill
+            gross_cell = ws_daily.cell(row=r_idx, column=3, value=day_gross)
+            gross_cell.font = regular_font
+            gross_cell.number_format = '"₹"#,##0.00'
+
+            cost_cell = ws_daily.cell(row=r_idx, column=4, value=day_costs)
+            cost_cell.font = regular_font
+            cost_cell.number_format = '"₹"#,##0.00'
+
+            net_cell = ws_daily.cell(row=r_idx, column=5, value=day_net)
+            net_cell.font = bold_font
+            net_cell.number_format = '"₹"#,##0.00'
+            net_cell.fill = green_fill if day_net >= 0 else red_fill
 
         ws_daily.column_dimensions["A"].width = 15
         ws_daily.column_dimensions["B"].width = 15
         ws_daily.column_dimensions["C"].width = 20
+        ws_daily.column_dimensions["D"].width = 20
+        ws_daily.column_dimensions["E"].width = 20
 
         # Save
         wb.save(filepath)

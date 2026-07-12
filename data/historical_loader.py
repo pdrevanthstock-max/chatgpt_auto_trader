@@ -32,51 +32,122 @@ class HistoricalLoader:
     ) -> List[HistoricalDayData]:
         """
         Fetches option data for all relative strikes (ATM, ITM1-N, OTM1-N)
-        and groups them by trading day.
+        and groups them by trading day, with offline cache fallback.
         """
+        from config.settings import DHAN_ACCESS_TOKEN, PROJECT_ROOT
+        import json
+
         # Build relative strike labels
         strikes = ["ATM"]
         for i in range(1, scan_range + 1):
             strikes.append(f"ITM{i}")
             strikes.append(f"OTM{i}")
 
-        logger.info(f"Preparing to fetch {len(strikes) * 2} option series for date range {from_date} to {to_date}")
+        use_offline_cache = False
+        if not DHAN_ACCESS_TOKEN or len(DHAN_ACCESS_TOKEN) < 10:
+            logger.info("DHAN_ACCESS_TOKEN is missing or invalid. Using offline cache fallback.")
+            use_offline_cache = True
 
-        # Fetch in parallel using thread pool to speed up data loading
-        results = {}
-        futures = {}
-        
-        with ThreadPoolExecutor(max_workers=5) as executor:
-            for strike in strikes:
-                for op_type in ["CALL", "PUT"]:
-                    key = (strike, op_type)
-                    futures[executor.submit(
-                        self.client.get_expired_options_data,
-                        option_type=op_type,
-                        from_date=from_date,
-                        to_date=to_date,
-                        strike=strike,
-                        interval=1 # Always fetch 1-minute data from Dhan API
-                    )] = key
+        if not use_offline_cache:
+            try:
+                logger.info(f"Preparing to fetch {len(strikes) * 2} option series for date range {from_date} to {to_date}")
+                results = {}
+                futures = {}
+                
+                with ThreadPoolExecutor(max_workers=5) as executor:
+                    for strike in strikes:
+                        for op_type in ["CALL", "PUT"]:
+                            key = (strike, op_type)
+                            futures[executor.submit(
+                                self.client.get_expired_options_data,
+                                option_type=op_type,
+                                from_date=from_date,
+                                to_date=to_date,
+                                strike=strike,
+                                interval=1 # Always fetch 1-minute data from Dhan API
+                            )] = key
 
-            for future in as_completed(futures):
-                strike, op_type = futures[future]
-                try:
-                    raw = future.result()
-                    df = self._parse_raw_df(raw, strike, op_type, interval_minutes)
-                    if not df.empty:
-                        results[(strike, op_type)] = df
-                        logger.info(f"Loaded {len(df)} candles for {strike} {op_type}")
-                    else:
-                        logger.warning(f"No candles parsed for {strike} {op_type}")
-                except Exception as e:
-                    logger.error(f"Error fetching data for {strike} {op_type}: {e}")
+                    for future in as_completed(futures):
+                        strike, op_type = futures[future]
+                        try:
+                            raw = future.result()
+                            # Check if the API returned an authentication error
+                            if isinstance(raw, dict) and raw.get("status") == "failure" and "Authentication" in raw.get("remarks", {}).get("error_message", ""):
+                                raise ValueError("Invalid access token returned by API.")
+                            df = self._parse_raw_df(raw, strike, op_type, interval_minutes)
+                            if not df.empty:
+                                results[(strike, op_type)] = df
+                                logger.info(f"Loaded {len(df)} candles for {strike} {op_type}")
+                            else:
+                                logger.warning(f"No candles parsed for {strike} {op_type}")
+                        except Exception as e:
+                            logger.error(f"Error fetching data for {strike} {op_type}: {e}")
 
-        if not results:
-            raise InsufficientDataError(f"No historical data returned for range {from_date} to {to_date}")
+                if not results:
+                    raise InsufficientDataError(f"No historical data returned for range {from_date} to {to_date}")
+                
+                return self._align_and_group(results, strikes)
+            except Exception as e:
+                logger.warning(f"Dhan API fetch failed ({e}). Falling back to offline cache...")
+                use_offline_cache = True
 
-        # Align all loaded series by timestamp
-        return self._align_and_group(results, strikes)
+        if use_offline_cache:
+            cache_file = PROJECT_ROOT / "cache" / "cache_06883e782d7c16e4.json"
+            if cache_file.exists():
+                logger.info(f"Loading from offline cache file: {cache_file}")
+                with open(cache_file, "r") as f:
+                    cache_data = json.load(f)
+                
+                day_map = {}
+                from_dt = pd.to_datetime(from_date).date()
+                to_dt = pd.to_datetime(to_date).date()
+                
+                for item in cache_data:
+                    item_date = pd.to_datetime(item["date"]).date()
+                    if from_dt <= item_date <= to_dt:
+                        day_data = HistoricalDayData(item_date)
+                        for c_data in item.get("candles", []):
+                            ts = pd.to_datetime(c_data["ts"])
+                            day_data.timestamps.append(ts)
+                            day_data.candles[ts] = {"ATM": {}}
+                            
+                            # Reconstruct CE and PE candles
+                            # Anchor base strike to Nifty index level of June 2026 (24300)
+                            ce_candle = Candle(
+                                timestamp=ts,
+                                open=c_data["co"],
+                                high=c_data["ch"],
+                                low=c_data["cl"],
+                                close=c_data["cc"],
+                                volume=int(c_data["cv"]),
+                                oi=0,
+                                strike=24300.0,
+                                spot=24300.0 + c_data["cc"] - c_data["pc"]
+                            )
+                            pe_candle = Candle(
+                                timestamp=ts,
+                                open=c_data["po"],
+                                high=c_data["ph"],
+                                low=c_data["pl"],
+                                close=c_data["pc"],
+                                volume=int(c_data["pv"]),
+                                oi=0,
+                                strike=24300.0,
+                                spot=24300.0 + c_data["cc"] - c_data["pc"]
+                            )
+                            day_data.candles[ts]["ATM"]["CE"] = ce_candle
+                            day_data.candles[ts]["ATM"]["PE"] = pe_candle
+                        
+                        day_map[item_date] = day_data
+                
+                sorted_days = [day_map[d] for d in sorted(day_map.keys())]
+                if sorted_days:
+                    logger.info(f"Offline cache loaded {len(sorted_days)} trading days successfully.")
+                    return sorted_days
+                
+            raise InsufficientDataError(
+                f"No offline cache or live data available for range {from_date} to {to_date}."
+            )
 
     def _parse_raw_df(self, raw: Dict[str, Any], strike: str, op_type: str, interval_minutes: int) -> pd.DataFrame:
         """Parse raw response from expired_options_data API endpoint."""
@@ -116,6 +187,8 @@ class HistoricalLoader:
 
             volume = get_list_field(leg_data, ["volume"], target_len)
             oi = get_list_field(leg_data, ["oi", "open_interest"], target_len)
+            strike_list = get_list_field(leg_data, ["strike"], target_len)
+            spot_list = get_list_field(leg_data, ["spot"], target_len)
 
             df = pd.DataFrame({
                 "timestamp": timestamps,
@@ -124,7 +197,9 @@ class HistoricalLoader:
                 "low": leg_data["low"],
                 "close": leg_data["close"],
                 "volume": volume,
-                "oi": oi
+                "oi": oi,
+                "strike": strike_list,
+                "spot": spot_list
             })
 
             # Resample to multi-minute interval if required
@@ -136,7 +211,9 @@ class HistoricalLoader:
                     "low": "min",
                     "close": "last",
                     "volume": "sum",
-                    "oi": "last"
+                    "oi": "last",
+                    "strike": "first",
+                    "spot": "last"
                 }).dropna().reset_index()
 
             return df
@@ -205,5 +282,7 @@ class HistoricalLoader:
             low=row["low"],
             close=row["close"],
             volume=int(row.get("volume", 0)),
-            oi=int(row.get("oi", 0))
+            oi=int(row.get("oi", 0)),
+            strike=float(row.get("strike", 0.0)),
+            spot=float(row.get("spot", 0.0))
         )

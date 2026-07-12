@@ -37,6 +37,8 @@ class DBTrade(Base):
     exit_time = Column(DateTime, nullable=True)
     exit_reason = Column(String(50), nullable=True)
     combined_pnl = Column(Float, default=0.0)
+    gross_pnl = Column(Float, default=0.0)
+    net_pnl = Column(Float, default=0.0)
 
 class TradeStore:
     """Handles SQLite persistence for trades."""
@@ -48,6 +50,22 @@ class TradeStore:
 
         self.engine = create_engine(self.db_url, connect_args={"check_same_thread": False})
         Base.metadata.create_all(self.engine)
+        
+        # Dynamic migration check to add gross_pnl/net_pnl columns to existing database
+        try:
+            from sqlalchemy import inspect, text
+            inspector = inspect(self.engine)
+            if "trades" in inspector.get_table_names():
+                columns = [c["name"] for c in inspector.get_columns("trades")]
+                with self.engine.begin() as conn:
+                    if "gross_pnl" not in columns:
+                        conn.execute(text("ALTER TABLE trades ADD COLUMN gross_pnl FLOAT DEFAULT 0.0"))
+                    if "net_pnl" not in columns:
+                        conn.execute(text("ALTER TABLE trades ADD COLUMN net_pnl FLOAT DEFAULT 0.0"))
+            logger.info("TradeStore schema migration check successful.")
+        except Exception as e:
+            logger.warning(f"TradeStore migration check failed (non-blocking): {e}")
+
         self.Session = sessionmaker(bind=self.engine)
         logger.info(f"TradeStore initialized at {self.db_url}")
 
@@ -79,6 +97,8 @@ class TradeStore:
             db_trade.exit_time = trade.exit_time
             db_trade.exit_reason = trade.exit_reason.value if trade.exit_reason else None
             db_trade.combined_pnl = trade.combined_pnl
+            db_trade.gross_pnl = trade.gross_pnl
+            db_trade.net_pnl = trade.net_pnl
 
             session.commit()
             logger.debug(f"TradeStore: Saved trade {trade.id} to SQLite.")

@@ -632,21 +632,29 @@ def main():
 
             # Side-by-side Gross/Net PnL & Stats cards
             st.markdown("### Performance Metrics")
-            c1, c2, c3, c4 = st.columns(4)
+            c1, c2, c3, c4, c5 = st.columns(5)
             
-            pnl_color = "#10b981" if metrics["total_pnl"] >= 0 else "#ef4444"
-            c1.markdown(f'<div class="metric-card">Gross P&L<div class="metric-value" style="color: {pnl_color};">₹{metrics["total_pnl"]:,.2f}</div></div>', unsafe_allow_html=True)
-            c2.markdown(f'<div class="metric-card">Win Rate<div class="metric-value" style="color: #60a5fa;">{metrics["win_rate"]}%</div></div>', unsafe_allow_html=True)
-            c3.markdown(f'<div class="metric-card">Profit Factor<div class="metric-value" style="color: #fbbf24;">{metrics["profit_factor"]}</div></div>', unsafe_allow_html=True)
-            c4.markdown(f'<div class="metric-card">Max Drawdown<div class="metric-value" style="color: #f87171;">₹{metrics["max_drawdown"]:,.2f}</div></div>', unsafe_allow_html=True)
+            gross_pnl_color = "#10b981" if metrics["total_pnl"] >= 0 else "#ef4444"
+            net_pnl_color = "#10b981" if metrics["total_net_pnl"] >= 0 else "#ef4444"
+            
+            c1.markdown(f'<div class="metric-card">Gross P&L<div class="metric-value" style="color: {gross_pnl_color};">₹{metrics["total_pnl"]:,.2f}</div></div>', unsafe_allow_html=True)
+            c2.markdown(f'<div class="metric-card">Transaction Costs<div class="metric-value" style="color: #eab308;">₹{metrics["total_costs"]:,.2f}</div></div>', unsafe_allow_html=True)
+            c3.markdown(f'<div class="metric-card">Net P&L<div class="metric-value" style="color: {net_pnl_color};">₹{metrics["total_net_pnl"]:,.2f}</div></div>', unsafe_allow_html=True)
+            c4.markdown(f'<div class="metric-card">Win Rate<div class="metric-value" style="color: #60a5fa;">{metrics["win_rate"]}%</div></div>', unsafe_allow_html=True)
+            c5.markdown(f'<div class="metric-card">Max Drawdown (Net)<div class="metric-value" style="color: #f87171;">₹{metrics["max_drawdown"]:,.2f}</div></div>', unsafe_allow_html=True)
 
             # Equity Curve chart
             st.markdown("### Equity Curve")
-            equity = [config.total_capital]
+            gross_equity = [config.total_capital]
+            net_equity = [config.total_capital]
             for t in trades:
-                equity.append(equity[-1] + t.combined_pnl)
+                gross_equity.append(gross_equity[-1] + t.combined_pnl)
+                net_equity.append(net_equity[-1] + t.net_pnl)
             
-            df_eq = pd.DataFrame({"Portfolio Value": equity})
+            df_eq = pd.DataFrame({
+                "Gross Portfolio Value": gross_equity,
+                "Net Portfolio Value": net_equity
+            })
             st.line_chart(df_eq)
 
             # Excel download
@@ -733,7 +741,9 @@ def main():
                     "PE Exit": t.exit_pe_price if t.exit_pe_price else "N/A",
                     "Exit Time": t.exit_time.strftime("%m-%d %H:%M:%S") if t.exit_time else "OPEN",
                     "Reason": t.exit_reason.value if t.exit_reason else "N/A",
-                    "PnL (₹)": t.combined_pnl
+                    "Gross PnL (₹)": t.combined_pnl,
+                    "Transaction Costs (₹)": t.transaction_costs,
+                    "Net PnL (₹)": t.net_pnl
                 })
             
             df_hist = pd.DataFrame(rows)

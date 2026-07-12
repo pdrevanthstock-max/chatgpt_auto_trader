@@ -47,9 +47,23 @@ class SimulatedFill:
         return trade
 
     def fill_exit_both(self, trade: Trade, candle: PairedCandle, reason: ExitReason) -> None:
-        # Exit fills at the current candle close (or open if EOD square-off)
-        ce_exit = candle.ce_close
-        pe_exit = candle.pe_close
+        if reason == ExitReason.TARGET_HIT and trade.target_pnl is not None:
+            # Scale exit prices so that their combined PnL equals target_pnl exactly (no overshoot)
+            combined_entry = trade.entry_ce_price + trade.entry_pe_price
+            target_combined_exit = combined_entry + (trade.target_pnl / (trade.quantity * trade.lot_size))
+            
+            # Distribute proportionally by candle closes
+            total_close = candle.ce_close + candle.pe_close
+            if total_close > 0:
+                ce_exit = round(target_combined_exit * (candle.ce_close / total_close), 2)
+                pe_exit = round(target_combined_exit * (candle.pe_close / total_close), 2)
+            else:
+                ce_exit = round(target_combined_exit / 2.0, 2)
+                pe_exit = round(target_combined_exit / 2.0, 2)
+        else:
+            # Exit fills at the current candle close (or open if EOD square-off)
+            ce_exit = candle.ce_close
+            pe_exit = candle.pe_close
 
         trade.exit_ce_price = ce_exit
         trade.exit_pe_price = pe_exit

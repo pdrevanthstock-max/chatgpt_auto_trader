@@ -16,6 +16,8 @@ class Candle:
     close: float
     volume: int = 0
     oi: int = 0
+    strike: float = 0.0
+    spot: float = 0.0
 
 @dataclass(frozen=True)
 class PairedCandle:
@@ -108,6 +110,7 @@ class Trade:
     exit_pe_price: Optional[float] = None
     exit_time: Optional[datetime] = None
     exit_reason: Optional[ExitReason] = None
+    target_pnl: Optional[float] = None  # Saved target for exit precision
 
     @property
     def is_open(self) -> bool:
@@ -169,6 +172,19 @@ class Trade:
                 ce_p = (ce_ex - self.entry_ce_price) * self.quantity * self.lot_size
                 pe_p = (pe_ex - self.entry_pe_price) * self.quantity * self.lot_size
                 return round(ce_p + pe_p, 2)
+
+    @property
+    def gross_pnl(self) -> float:
+        return self.combined_pnl
+
+    @property
+    def transaction_costs(self) -> float:
+        # Deduct flat transaction costs: ₹103 round-trip per lot
+        return round(103.0 * self.quantity, 2)
+
+    @property
+    def net_pnl(self) -> float:
+        return round(self.combined_pnl - self.transaction_costs, 2)
 
 @dataclass
 class DaySession:

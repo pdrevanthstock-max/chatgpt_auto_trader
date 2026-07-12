@@ -27,6 +27,10 @@ class ExecutionValidator:
         if active_trade is not None and active_trade.is_open:
             return False, f"Trade {active_trade.id} is already active. Overlapping entry blocked."
 
+        # In BACKTEST mode, bypass the live market spread, latency, and cache staleness checks
+        if config.execution_mode == "BACKTEST":
+            return True, "Validation successful (Backtest mode bypass)"
+
         # 3. Cache freshness & Broker connectivity
         last_update, latency_ms = market_cache.get_health()
         if not last_update:

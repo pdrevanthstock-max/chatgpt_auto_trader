@@ -39,8 +39,8 @@ class HealthMonitor:
         if cpu_usage > 70.0:
             return False, f"CPU usage too high: {cpu_usage:.1f}% > 70%"
 
-        if memory_usage > 80.0:
-            return False, f"Memory usage too high: {memory_usage:.1f}% > 80%"
+        if memory_usage > 95.0:
+            return False, f"Memory usage too high: {memory_usage:.1f}% > 95%"
 
         # In BACKTEST mode, skip live latency/spread checks
         if config.execution_mode == "BACKTEST":

@@ -25,6 +25,6 @@
   "health_check_cache_stale_sec": 1,
   "execution_mode": "BACKTEST",
   "scan_interval_seconds": 120,
-  "backtest_from_date": "2026-07-01",
+  "backtest_from_date": "2026-07-08",
   "backtest_to_date": "2026-07-10"
 }

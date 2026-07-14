@@ -29,6 +29,21 @@ class ExitManager:
         trade.pe_current_price = pe_price
 
         current_pnl = trade.combined_pnl
+        current_net_pnl = trade.net_pnl
+
+        # This stop is independent of prior profit. The amount is frozen when
+        # the trade opens, based on equity then available, so subsequent account
+        # changes cannot silently widen an open trade's risk.
+        hard_stop_loss = trade.hard_stop_loss
+        if hard_stop_loss <= 0.0:
+            risk_capital = trade.risk_capital_at_entry or config.total_capital
+            hard_stop_loss = risk_capital * config.per_trade_loss_limit_pct
+        if current_net_pnl <= -abs(hard_stop_loss):
+            logger.warning(
+                f"ExitManager (HARD_STOP): Net PnL Rs {current_net_pnl:.2f} "
+                f"breached stop Rs {-abs(hard_stop_loss):.2f}."
+            )
+            return ExitReason.HARD_STOP
         
         # Track peak profit (only track if PnL is positive to avoid immediate triggering)
         if current_pnl > 0.0:

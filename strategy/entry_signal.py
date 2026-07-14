@@ -16,13 +16,25 @@ class EntrySignal:
         candidates: List[CandidatePair],
         regime: MarketRegime,
         spot_trend: str,  # "UP", "DOWN", "SIDEWAYS"
-        config: TradingConfig
+        config: TradingConfig,
+        spot_price: float = 0.0,
     ) -> List[CandidatePair]:
         survivors = []
         min_band = config.divergence_band_min
         max_band = config.divergence_band_max
 
         for candidate in candidates:
+            # A less-negative option is not a winning leg. Buying both legs while
+            # both premiums decay has negative edge, especially near expiry.
+            if candidate.ce_velocity <= 0.0 and candidate.pe_velocity <= 0.0:
+                continue
+            if (
+                spot_price > 0.0
+                and candidate.ce_strike > spot_price
+                and candidate.pe_strike < spot_price
+            ):
+                continue
+
             # Condition 1: Divergence band check
             if not (min_band <= candidate.divergence <= max_band):
                 continue

@@ -80,6 +80,8 @@ class TradePlan:
     ce_limit_price: Optional[float] = None
     pe_limit_price: Optional[float] = None
     post_daily_sl: bool = False
+    risk_capital_at_entry: float = 0.0
+    hard_stop_loss: float = 0.0
 
 @dataclass
 class Trade:
@@ -96,6 +98,10 @@ class Trade:
     regime_at_entry: MarketRegime = MarketRegime.SIDEWAYS
     phase: TradePhase = TradePhase.PHASE_1_BOTH_LEGS
     post_daily_sl: bool = False
+    risk_capital_at_entry: float = 0.0
+    hard_stop_loss: float = 0.0
+    ce_open_units: Optional[int] = None
+    pe_open_units: Optional[int] = None
     
     # State tracking
     ce_current_price: float = 0.0
@@ -239,14 +245,14 @@ class DaySession:
         trade = self.open_trade
         if trade is None:
             return 0.0
-        return trade.combined_pnl
+        return trade.net_pnl
 
     @property
     def total_pnl(self) -> float:
         return round(self.realized_pnl + self.unrealized_pnl, 2)
 
     def close_trade(self, trade: Trade) -> None:
-        self.realized_pnl = round(self.realized_pnl + trade.combined_pnl, 2)
+        self.realized_pnl = round(self.realized_pnl + trade.net_pnl, 2)
 
 @dataclass
 class ExecutionSignal:

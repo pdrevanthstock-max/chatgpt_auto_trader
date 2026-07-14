@@ -1,6 +1,8 @@
 # AutoTrader — CE/PE Divergence Capture Strategy
 ## Requirements & Architecture Specification
 
+> **Historical specification notice (2026-07-14):** Several requirements in this file were superseded by later user decisions and safety work. Before implementing or changing behavior, read `docs/SYSTEM_EVOLUTION_AND_CURRENT_ARCHITECTURE_2026-07-13_TO_2026-07-14.md`. Its requirement-precedence table, safety invariants, current architecture, and unresolved-risk list govern where this legacy document conflicts with the current tested system.
+
 **Purpose of this document:** This is the single source of truth for the strategy Revanth wants built. It exists because two prior AI-assisted rebuilds (ChatGPT-based `AutoTrader-alpha`, Antigravity-based `antigravity-alpha`) each independently invented a *different* strategy — a simple single-leg spot-vs-strike directional bot — instead of building this one. Any coding assistant working on this project must implement what is written here, not infer a "reasonable" trading strategy on its own.
 
 If anything in an existing repository contradicts this document, this document wins.

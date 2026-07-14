@@ -2,8 +2,7 @@ import logging
 from datetime import datetime
 from typing import List, Optional
 from sqlalchemy import create_engine, Column, String, Integer, Float, DateTime, Boolean
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import declarative_base, sessionmaker
 from config.settings import DATABASE_DIR
 from core.models import Trade
 from core.enums import TradeDirection, MarketRegime, TradePhase, ExitReason
@@ -28,6 +27,10 @@ class DBTrade(Base):
     regime_at_entry = Column(String(50), nullable=False)
     phase = Column(String(50), nullable=False)
     post_daily_sl = Column(Boolean, default=False, nullable=False)
+    risk_capital_at_entry = Column(Float, default=0.0, nullable=False)
+    hard_stop_loss = Column(Float, default=0.0, nullable=False)
+    ce_open_units = Column(Integer, nullable=True)
+    pe_open_units = Column(Integer, nullable=True)
     
     hedge_cut_time = Column(DateTime, nullable=True)
     losing_leg_exit_price = Column(Float, nullable=True)
@@ -65,6 +68,14 @@ class TradeStore:
                         conn.execute(text("ALTER TABLE trades ADD COLUMN net_pnl FLOAT DEFAULT 0.0"))
                     if "post_daily_sl" not in columns:
                         conn.execute(text("ALTER TABLE trades ADD COLUMN post_daily_sl BOOLEAN NOT NULL DEFAULT 0"))
+                    if "risk_capital_at_entry" not in columns:
+                        conn.execute(text("ALTER TABLE trades ADD COLUMN risk_capital_at_entry FLOAT NOT NULL DEFAULT 0.0"))
+                    if "hard_stop_loss" not in columns:
+                        conn.execute(text("ALTER TABLE trades ADD COLUMN hard_stop_loss FLOAT NOT NULL DEFAULT 0.0"))
+                    if "ce_open_units" not in columns:
+                        conn.execute(text("ALTER TABLE trades ADD COLUMN ce_open_units INTEGER"))
+                    if "pe_open_units" not in columns:
+                        conn.execute(text("ALTER TABLE trades ADD COLUMN pe_open_units INTEGER"))
             logger.info("TradeStore schema migration check successful.")
         except Exception as e:
             logger.warning(f"TradeStore migration check failed (non-blocking): {e}")
@@ -91,6 +102,10 @@ class TradeStore:
             db_trade.regime_at_entry = trade.regime_at_entry.value
             db_trade.phase = trade.phase.value
             db_trade.post_daily_sl = bool(getattr(trade, "post_daily_sl", False))
+            db_trade.risk_capital_at_entry = trade.risk_capital_at_entry
+            db_trade.hard_stop_loss = trade.hard_stop_loss
+            db_trade.ce_open_units = trade.ce_open_units
+            db_trade.pe_open_units = trade.pe_open_units
             
             db_trade.hedge_cut_time = trade.hedge_cut_time
             db_trade.losing_leg_exit_price = trade.losing_leg_exit_price
@@ -131,6 +146,10 @@ class TradeStore:
                     regime_at_entry=MarketRegime(db_t.regime_at_entry),
                     phase=TradePhase(db_t.phase),
                     post_daily_sl=bool(getattr(db_t, "post_daily_sl", False)),
+                    risk_capital_at_entry=float(getattr(db_t, "risk_capital_at_entry", 0.0) or 0.0),
+                    hard_stop_loss=float(getattr(db_t, "hard_stop_loss", 0.0) or 0.0),
+                    ce_open_units=getattr(db_t, "ce_open_units", None),
+                    pe_open_units=getattr(db_t, "pe_open_units", None),
                     hedge_cut_time=db_t.hedge_cut_time,
                     losing_leg_exit_price=db_t.losing_leg_exit_price,
                     losing_leg_pnl=db_t.losing_leg_pnl,

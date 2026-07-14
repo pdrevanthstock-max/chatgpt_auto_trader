@@ -33,8 +33,14 @@ class PairRanker:
             if not ce_data or not pe_data:
                 continue
 
-            ce_price = ce_data.get("last", ce_data.get("close", 0.0))
-            pe_price = pe_data.get("last", pe_data.get("close", 0.0))
+            if config.execution_mode == "BACKTEST":
+                ce_price = ce_data.get("last", ce_data.get("close", 0.0))
+                pe_price = pe_data.get("last", pe_data.get("close", 0.0))
+            else:
+                # A long entry pays the ask; ranking on LTP can invent profit
+                # that is unavailable at the executable price.
+                ce_price = ce_data.get("ask", 0.0)
+                pe_price = pe_data.get("ask", 0.0)
             
             # Premium similarity check (maximum 10% difference as requested by user)
             if ce_price <= 0.0 or pe_price <= 0.0:
@@ -65,6 +71,8 @@ class PairRanker:
                 lot_size=config.nifty_lot_size,
             ).total
             projected_net_profit = expected_combined_pnl_rupees - estimated_costs - slippage_cost
+            if projected_net_profit <= 0.0:
+                continue
 
             # Calculate confidence score (deterministic heuristics)
             confidence = 60.0  # Base confidence

@@ -19,10 +19,20 @@ def test_position_sizer():
     assert sizer.calculate_lots(0.0, 100.0, config) == 0
 
 
-def test_position_sizer_keeps_quantity_dynamic_for_low_premium_pair():
+def test_position_sizer_keeps_quantity_dynamic_but_caps_low_premium_pair():
     config = TradingConfig(total_capital=45000.0, nifty_lot_size=65)
 
     lots = PositionSizer().calculate_lots(1.95, 1.90, config)
 
-    assert lots == 179
-    assert lots * config.nifty_lot_size == 11_635
+    assert lots == 27
+    assert lots * config.nifty_lot_size == 1_755
+
+
+def test_position_sizer_uses_remaining_available_capital():
+    config = TradingConfig(total_capital=45_000.0, nifty_lot_size=65)
+
+    lots = PositionSizer().calculate_lots(
+        100.0, 100.0, config, available_capital=20_000.0
+    )
+
+    assert lots == 1

@@ -4,6 +4,17 @@ All notable changes to the AutoTrader-alpha project.
 
 ---
 
+## [Safety, Price Integrity, and Capital Controls] — 2026-07-13 to 2026-07-14
+
+- Hardened historical, PAPER, and LIVE/PAPER orchestration behavior.
+- Replaced flat per-lot transaction costs with order/turnover-based option charges.
+- Added executable ask/bid PAPER fills, fail-closed quote validation, dynamic hard stops, expiry/dual-decay/OTM gates, and a temporary unit ceiling.
+- Added lots/units visibility, PAPER post-daily-SL tagging, capital transaction auditing, read-only LIVE allocation controls, a persistent LIVE daily stop, broker partial-fill containment, and a PAPER profitability gate before LIVE.
+- Expanded the automated suite to 90 passing tests.
+- Full timeline, current architecture, requirement-precedence decisions, operational steps, and unresolved LIVE blockers are recorded in [`docs/SYSTEM_EVOLUTION_AND_CURRENT_ARCHITECTURE_2026-07-13_TO_2026-07-14.md`](docs/SYSTEM_EVOLUTION_AND_CURRENT_ARCHITECTURE_2026-07-13_TO_2026-07-14.md).
+
+---
+
 ## [Phase 6] — 2026-07-11
 
 ### Rebuild, Code Audit Resolution & Operational Start/Stop

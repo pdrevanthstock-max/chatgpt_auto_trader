@@ -20,26 +20,58 @@ class CrashRecovery:
         else:
             self.filepath = REPORTS_DIR / "persistent_state.json"
 
-    def save_state(self, realized_pnl: float, active_trade: Optional[Trade]) -> None:
+    def _state_filepath(self, execution_mode: Optional[str]) -> Path:
+        if execution_mode is None:
+            return self.filepath
+        mode = str(execution_mode).strip().lower()
+        if mode not in {"paper", "live"}:
+            raise ValueError("Recovery execution mode must be PAPER or LIVE.")
+        return self.filepath.with_name(
+            f"{self.filepath.stem}_{mode}{self.filepath.suffix}"
+        )
+
+    def save_state(
+        self,
+        realized_pnl: float,
+        active_trade: Optional[Trade],
+        execution_mode: Optional[str] = None,
+    ) -> None:
         try:
             state = {
                 "timestamp": datetime.now().isoformat(),
+                "execution_mode": execution_mode,
                 "realized_pnl": realized_pnl,
                 "active_trade": self._serialize_trade(active_trade) if active_trade else None
             }
-            with open(self.filepath, "w", encoding="utf-8") as f:
+            state_filepath = self._state_filepath(execution_mode)
+            with open(state_filepath, "w", encoding="utf-8") as f:
                 json.dump(state, f, indent=2, ensure_ascii=False)
             logger.debug("CrashRecovery: State persisted successfully.")
         except Exception as e:
             logger.error(f"CrashRecovery: Failed to save state: {e}")
 
-    def load_state(self) -> Tuple[float, Optional[Trade]]:
+    def load_state(
+        self,
+        execution_mode: Optional[str] = None,
+    ) -> Tuple[float, Optional[Trade]]:
         """Loads realized PnL and active trade from persistent state file."""
-        if not self.filepath.exists():
+        state_filepath = self._state_filepath(execution_mode)
+        if not state_filepath.exists():
+            # Migrate the legacy unscoped simulation state only into PAPER. It is
+            # intentionally never trusted as LIVE broker state.
+            if (
+                str(execution_mode).upper() == "PAPER"
+                and self.filepath.exists()
+            ):
+                state_filepath = self.filepath
+            else:
+                return 0.0, None
+
+        if not state_filepath.exists():
             return 0.0, None
 
         try:
-            with open(self.filepath, "r", encoding="utf-8") as f:
+            with open(state_filepath, "r", encoding="utf-8") as f:
                 state = json.load(f)
             
             realized_pnl = state.get("realized_pnl", 0.0)
@@ -111,6 +143,10 @@ class CrashRecovery:
             "regime_at_entry": trade.regime_at_entry.value,
             "phase": trade.phase.value,
             "post_daily_sl": bool(getattr(trade, "post_daily_sl", False)),
+            "risk_capital_at_entry": trade.risk_capital_at_entry,
+            "hard_stop_loss": trade.hard_stop_loss,
+            "ce_open_units": trade.ce_open_units,
+            "pe_open_units": trade.pe_open_units,
             "ce_current_price": trade.ce_current_price,
             "pe_current_price": trade.pe_current_price,
             "peak_combined_pnl": trade.peak_combined_pnl,
@@ -138,6 +174,10 @@ class CrashRecovery:
             regime_at_entry=MarketRegime(data["regime_at_entry"]),
             phase=TradePhase(data["phase"]),
             post_daily_sl=bool(data.get("post_daily_sl", False)),
+            risk_capital_at_entry=float(data.get("risk_capital_at_entry", 0.0)),
+            hard_stop_loss=float(data.get("hard_stop_loss", 0.0)),
+            ce_open_units=data.get("ce_open_units"),
+            pe_open_units=data.get("pe_open_units"),
             ce_current_price=data["ce_current_price"],
             pe_current_price=data["pe_current_price"],
             peak_combined_pnl=data["peak_combined_pnl"],

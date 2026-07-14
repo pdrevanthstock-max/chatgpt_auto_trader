@@ -42,6 +42,10 @@ class SimulatedFill:
             regime_at_entry=plan.regime,
             phase=TradePhase.PHASE_1_BOTH_LEGS,
             post_daily_sl=plan.post_daily_sl,
+            risk_capital_at_entry=plan.risk_capital_at_entry,
+            hard_stop_loss=plan.hard_stop_loss,
+            ce_open_units=plan.quantity * plan.lot_size,
+            pe_open_units=plan.quantity * plan.lot_size,
             ce_current_price=ce_price,
             pe_current_price=pe_price
         )
@@ -70,6 +74,8 @@ class SimulatedFill:
         trade.exit_pe_price = pe_exit
         trade.exit_time = candle.timestamp
         trade.exit_reason = reason
+        trade.ce_open_units = 0
+        trade.pe_open_units = 0
         trade.phase = TradePhase.CLOSED
 
     def fill_hedge_cut(self, trade: Trade, candle: PairedCandle) -> None:
@@ -86,9 +92,11 @@ class SimulatedFill:
         if losing_leg == "PE":
             trade.exit_pe_price = losing_exit
             trade.pe_current_price = losing_exit
+            trade.pe_open_units = 0
         else:
             trade.exit_ce_price = losing_exit
             trade.ce_current_price = losing_exit
+            trade.ce_open_units = 0
 
         trade.phase = TradePhase.PHASE_2_SINGLE_LEG
 
@@ -99,9 +107,11 @@ class SimulatedFill:
         if winning_leg == "CE":
             trade.exit_ce_price = winning_exit
             trade.ce_current_price = winning_exit
+            trade.ce_open_units = 0
         else:
             trade.exit_pe_price = winning_exit
             trade.pe_current_price = winning_exit
+            trade.pe_open_units = 0
 
         trade.exit_time = candle.timestamp
         trade.exit_reason = reason

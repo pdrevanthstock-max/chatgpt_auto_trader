@@ -293,7 +293,9 @@ class BacktestEngine:
                     scanned = self.scanner.scan_candidates(filtered_candidates)
                     
                     # Evaluate entry signals
-                    survivors = self.entry_signal.evaluate_signals(scanned, regime, spot_trend, self.config)
+                    survivors = self.entry_signal.evaluate_signals(
+                        scanned, regime, spot_trend, self.config, spot_price=spot_close
+                    )
                     
                     # Rank candidates
                     top_candidate = self.ranker.rank_candidates(survivors, self.config)
@@ -307,7 +309,12 @@ class BacktestEngine:
                             pe_last = pe_data["last"]
                             
                             # Quantity sizing
-                            qty = self.sizer.calculate_lots(ce_last, pe_last, self.config)
+                            qty = self.sizer.calculate_lots(
+                                ce_last,
+                                pe_last,
+                                self.config,
+                                available_capital=self.config.entry_equity(day_session.realized_pnl),
+                            )
                             
                             if qty > 0:
                                 # Trade Plan
@@ -319,6 +326,8 @@ class BacktestEngine:
                                     pe_price=pe_last,
                                     config=self.config
                                 )
+                                plan.risk_capital_at_entry = self.config.entry_equity(day_session.realized_pnl)
+                                plan.hard_stop_loss = self.config.per_trade_loss_limit(plan.risk_capital_at_entry)
                                 
                                 # Validate Entry
                                 is_valid, reason = self.validator.validate_entry(
@@ -352,7 +361,10 @@ class BacktestEngine:
                 filtered_candidates.append((ce, pe))
                 
         scanned = self.scanner.scan_candidates(filtered_candidates)
-        survivors = self.entry_signal.evaluate_signals(scanned, regime, "SIDEWAYS", self.config)
+        spot_price, _ = market_cache.get_spot()
+        survivors = self.entry_signal.evaluate_signals(
+            scanned, regime, "SIDEWAYS", self.config, spot_price=spot_price
+        )
         top_candidate = self.ranker.rank_candidates(survivors, self.config)
 
         if top_candidate:
@@ -369,7 +381,14 @@ class BacktestEngine:
                 pe_data = market_cache.get_option(top_candidate.pe_strike, "PE")
                 
                 if ce_data and pe_data:
-                    qty = self.sizer.calculate_lots(ce_data["last"], pe_data["last"], self.config)
+                    qty = self.sizer.calculate_lots(
+                        ce_data["last"],
+                        pe_data["last"],
+                        self.config,
+                        available_capital=self.config.entry_equity(
+                            day_session.realized_pnl + self.active_trade.net_pnl
+                        ),
+                    )
                     if qty > 0:
                         new_plan = self.planner.plan_trade(
                             candidate=top_candidate,
@@ -394,6 +413,8 @@ class BacktestEngine:
         if signal.type == SignalType.ENTRY:
             # Simulated entry
             plan = signal.trade_plan
+            plan.risk_capital_at_entry = self.config.entry_equity(day_session.realized_pnl)
+            plan.hard_stop_loss = self.config.per_trade_loss_limit(plan.risk_capital_at_entry)
             ce_strike = plan.scored_candidate.ce_strike
             pe_strike = plan.scored_candidate.pe_strike
             
@@ -439,7 +460,7 @@ class BacktestEngine:
                         
                     # Add to session realized PnL
                     day_session.close_trade(self.active_trade)
-                    self.realized_pnl = round(self.realized_pnl + self.active_trade.combined_pnl, 2)
+                    self.realized_pnl = round(self.realized_pnl + self.active_trade.net_pnl, 2)
                     self.decision_memory.log_exit(self.active_trade.id, self.active_trade, reason_str)
                     
                     self.active_trade = None
@@ -482,7 +503,7 @@ class BacktestEngine:
                         self.filler.fill_single_leg_exit(self.active_trade, paired_candle, ExitReason.ROTATION)
                         
                     day_session.close_trade(self.active_trade)
-                    self.realized_pnl = round(self.realized_pnl + self.active_trade.combined_pnl, 2)
+                    self.realized_pnl = round(self.realized_pnl + self.active_trade.net_pnl, 2)
                     
                     # Set rotation cooldown on rotated strikes
                     self.rotation_engine.set_cooldown(self.active_trade.strike_ce, self.active_trade.strike_pe, ts, self.config)
@@ -494,6 +515,8 @@ class BacktestEngine:
                     
                     # 2. Enter new trade immediately
                     new_plan = signal.trade_plan
+                    new_plan.risk_capital_at_entry = self.config.entry_equity(day_session.realized_pnl)
+                    new_plan.hard_stop_loss = self.config.per_trade_loss_limit(new_plan.risk_capital_at_entry)
                     new_ce_strike = new_plan.scored_candidate.ce_strike
                     new_pe_strike = new_plan.scored_candidate.pe_strike
                     

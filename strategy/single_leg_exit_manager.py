@@ -25,6 +25,17 @@ class SingleLegExitManager:
         trade.ce_current_price = ce_price
         trade.pe_current_price = pe_price
 
+        hard_stop_loss = trade.hard_stop_loss
+        if hard_stop_loss <= 0.0:
+            risk_capital = trade.risk_capital_at_entry or config.total_capital
+            hard_stop_loss = risk_capital * config.per_trade_loss_limit_pct
+        if trade.net_pnl <= -abs(hard_stop_loss):
+            logger.warning(
+                f"SingleLegExitManager (HARD_STOP): Net PnL Rs {trade.net_pnl:.2f} "
+                f"breached stop Rs {-abs(hard_stop_loss):.2f}."
+            )
+            return ExitReason.HARD_STOP
+
         # Calculate winning leg PnL
         # PnL = (current_price - entry_price) * qty * lot_size
         winning_current = ce_price if trade.winning_leg == "CE" else pe_price

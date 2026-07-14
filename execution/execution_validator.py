@@ -52,6 +52,39 @@ class ExecutionValidator:
         if not ce_data or not pe_data:
             return False, "Option contracts missing from MarketCache at validation time."
 
+        now = datetime.now()
+        for leg, quote in (("CE", ce_data), ("PE", pe_data)):
+            quote_time = quote.get("timestamp")
+            if not isinstance(quote_time, datetime):
+                return False, f"{leg} selected contract has no valid quote timestamp."
+            quote_age = (now - quote_time).total_seconds()
+            if quote_age > config.health_check_cache_stale_sec:
+                return False, (
+                    f"{leg} selected contract is stale: {quote_age:.1f}s age > "
+                    f"limit {config.health_check_cache_stale_sec}s."
+                )
+
+        spot, _ = market_cache.get_spot()
+        if spot > 0.0:
+            ce_is_otm = plan.scored_candidate.ce_strike > spot
+            pe_is_otm = plan.scored_candidate.pe_strike < spot
+            if ce_is_otm and pe_is_otm:
+                return False, "Entry rejected: both OTM contracts expose the pair to dual premium decay."
+
+        active_expiry = market_cache.get_active_expiry()
+        if active_expiry is not None:
+            days_to_expiry = (active_expiry - now.date()).days
+            if days_to_expiry < 0:
+                return False, "Entry rejected: selected option expiry has already passed."
+            if days_to_expiry <= config.expiry_guard_days:
+                if plan.regime.value == "SIDEWAYS":
+                    return False, "Entry rejected by expiry guard: SIDEWAYS paired buying is disabled near expiry."
+                if spot > 0.0 and (
+                    abs(plan.scored_candidate.ce_strike - spot) > config.expiry_near_atm_points
+                    or abs(plan.scored_candidate.pe_strike - spot) > config.expiry_near_atm_points
+                ):
+                    return False, "Entry rejected by expiry guard: directional contracts must be ATM or near-ATM."
+
         ce_bid = ce_data.get("bid", 0.0)
         ce_ask = ce_data.get("ask", 0.0)
         pe_bid = pe_data.get("bid", 0.0)
@@ -66,7 +99,9 @@ class ExecutionValidator:
         entry_outlay = (
             (ce_ask + pe_ask) * plan.quantity * plan.lot_size
         )
-        if entry_outlay > config.total_capital:
+        available_capital = plan.risk_capital_at_entry or config.entry_equity(realized_pnl)
+        deployable_capital = available_capital * config.max_capital_deployment_pct
+        if entry_outlay > deployable_capital:
             return False, (
                 f"Executable entry outlay ₹{entry_outlay:.2f} exceeds available "
                 f"capital ₹{config.total_capital:.2f}."

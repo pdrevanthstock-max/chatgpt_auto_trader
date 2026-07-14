@@ -12,13 +12,14 @@ class DhanClient:
     MAX_RETRIES = 5
     RETRY_BASE_DELAY = 1.0
 
-    def __init__(self) -> None:
+    def __init__(self, orders_enabled: bool = False) -> None:
         if not DHAN_CLIENT_ID or not DHAN_ACCESS_TOKEN:
             logger.warning("DHAN_CLIENT_ID or DHAN_ACCESS_TOKEN not set in environment.")
         
         # Initialize context and client
         self.ctx = DhanContext(client_id=DHAN_CLIENT_ID, access_token=DHAN_ACCESS_TOKEN)
         self.client = dhanhq(self.ctx)
+        self.orders_enabled = bool(orders_enabled)
         logger.info("Dhan client wrapper initialized")
 
     def get_expired_options_data(
@@ -68,6 +69,8 @@ class DhanClient:
 
     def place_order(self, order_details: Dict[str, Any]) -> str:
         """Place live order on Dhan. Returns order ID."""
+        if not getattr(self, "orders_enabled", False):
+            raise DataFetchError("Dhan order writes are disabled for this client session.")
         try:
             # Structurally valid live order placement
             # Using order placement structure from Dhan API
@@ -79,6 +82,26 @@ class DhanClient:
         except Exception as e:
             raise DataFetchError(f"Failed to place order: {e}")
 
+    def cancel_order(self, order_id: str) -> bool:
+        """Cancel a pending live order; order writes must be explicitly enabled."""
+        if not getattr(self, "orders_enabled", False):
+            raise DataFetchError("Dhan order writes are disabled for this client session.")
+        try:
+            response = self.client.cancel_order(order_id)
+            if not isinstance(response, dict) or response.get("status") != "success":
+                raise DataFetchError(f"Order cancellation failed: {response}")
+            data = response.get("data", {})
+            status = str(data.get("orderStatus", "CANCELLED")).upper()
+            if status != "CANCELLED":
+                raise DataFetchError(
+                    f"Order {order_id} cancellation was not confirmed: {response}"
+                )
+            return True
+        except Exception as e:
+            if isinstance(e, DataFetchError):
+                raise
+            raise DataFetchError(f"Failed to cancel order {order_id}: {e}")
+
     def get_positions(self) -> List[Dict[str, Any]]:
         """Fetch open positions from broker."""
         try:
@@ -89,6 +112,42 @@ class DhanClient:
         except Exception as e:
             logger.error(f"Failed to fetch live positions: {e}")
             return []
+
+    def get_fund_limits(self) -> Dict[str, float]:
+        """Return normalized read-only broker funds for allocation validation."""
+        try:
+            response = self.client.get_fund_limits()
+            if not isinstance(response, dict) or response.get("status") != "success":
+                raise DataFetchError(f"Fund-limit query failed: {response}")
+            data = response.get("data")
+            if not isinstance(data, dict):
+                raise DataFetchError(f"Fund-limit response has no data: {response}")
+            available = data.get("availabelBalance", data.get("availableBalance"))
+            if available is None:
+                raise DataFetchError("Fund-limit response has no available balance.")
+            return {
+                "available_balance": float(available),
+                "utilized_amount": float(data.get("utilizedAmount", 0.0) or 0.0),
+                "sod_limit": float(data.get("sodLimit", 0.0) or 0.0),
+            }
+        except Exception as e:
+            if isinstance(e, DataFetchError):
+                raise
+            raise DataFetchError(f"Failed to fetch fund limits: {e}")
+    def get_order_by_id(self, order_id: str) -> Dict[str, Any]:
+        """Return the broker's current order record; placement alone is not a fill."""
+        try:
+            response = self.client.get_order_by_id(order_id)
+            if not isinstance(response, dict) or response.get("status") != "success":
+                raise DataFetchError(f"Order status query failed: {response}")
+            data = response.get("data")
+            if not isinstance(data, dict):
+                raise DataFetchError(f"Order status response has no order data: {response}")
+            return data
+        except Exception as e:
+            if isinstance(e, DataFetchError):
+                raise
+            raise DataFetchError(f"Failed to query order {order_id}: {e}")
 
     def validate_credentials(self) -> bool:
         """

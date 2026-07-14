@@ -1,6 +1,7 @@
 import logging
 from typing import List, Optional
 from core.models import CandidatePair, ScoredCandidate
+from core.transaction_costs import calculate_option_round_trip_costs
 from data.market_cache import market_cache
 from config.settings import TradingConfig
 
@@ -23,7 +24,6 @@ class PairRanker:
         chain = market_cache.get_option_chain()
         scored_list: List[ScoredCandidate] = []
 
-        brokerage_cost = 103.0
         slippage_cost = 10.0  # Rs 5 per leg average, 2 legs = Rs 10
 
         for candidate in candidates:
@@ -56,7 +56,15 @@ class PairRanker:
             expected_combined_change_pct = (expected_ce_move * ce_price + expected_pe_move * pe_price) / combined_premium
             expected_combined_pnl_rupees = (expected_combined_change_pct / 100.0) * combined_premium * config.nifty_lot_size
 
-            projected_net_profit = expected_combined_pnl_rupees - brokerage_cost - slippage_cost
+            estimated_costs = calculate_option_round_trip_costs(
+                entry_ce_price=ce_price,
+                entry_pe_price=pe_price,
+                exit_ce_price=ce_price,
+                exit_pe_price=pe_price,
+                lots=1,
+                lot_size=config.nifty_lot_size,
+            ).total
+            projected_net_profit = expected_combined_pnl_rupees - estimated_costs - slippage_cost
 
             # Calculate confidence score (deterministic heuristics)
             confidence = 60.0  # Base confidence

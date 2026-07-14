@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 from core.enums import TradeDirection, ExitReason, MarketRegime, TradePhase, OrderType, SignalType
+from core.transaction_costs import OptionCostBreakdown, calculate_option_round_trip_costs
 
 @dataclass(frozen=True)
 class Candle:
@@ -78,6 +79,7 @@ class TradePlan:
     lot_size: int = 65
     ce_limit_price: Optional[float] = None
     pe_limit_price: Optional[float] = None
+    post_daily_sl: bool = False
 
 @dataclass
 class Trade:
@@ -93,6 +95,7 @@ class Trade:
     entry_time: Optional[datetime] = None
     regime_at_entry: MarketRegime = MarketRegime.SIDEWAYS
     phase: TradePhase = TradePhase.PHASE_1_BOTH_LEGS
+    post_daily_sl: bool = False
     
     # State tracking
     ce_current_price: float = 0.0
@@ -178,9 +181,35 @@ class Trade:
         return self.combined_pnl
 
     @property
+    def units_per_leg(self) -> int:
+        return self.quantity * self.lot_size
+
+    @property
+    def display_id(self) -> str:
+        return f"{self.id}-SL" if self.post_daily_sl else self.id
+
+    @property
+    def transaction_cost_breakdown(self) -> OptionCostBreakdown:
+        ce_exit = self.exit_ce_price
+        if ce_exit is None:
+            ce_exit = self.ce_current_price if self.ce_current_price > 0.0 else self.entry_ce_price
+
+        pe_exit = self.exit_pe_price
+        if pe_exit is None:
+            pe_exit = self.pe_current_price if self.pe_current_price > 0.0 else self.entry_pe_price
+
+        return calculate_option_round_trip_costs(
+            entry_ce_price=self.entry_ce_price,
+            entry_pe_price=self.entry_pe_price,
+            exit_ce_price=ce_exit,
+            exit_pe_price=pe_exit,
+            lots=self.quantity,
+            lot_size=self.lot_size,
+        )
+
+    @property
     def transaction_costs(self) -> float:
-        # Deduct flat transaction costs: ₹103 round-trip per lot
-        return round(103.0 * self.quantity, 2)
+        return self.transaction_cost_breakdown.total
 
     @property
     def net_pnl(self) -> float:

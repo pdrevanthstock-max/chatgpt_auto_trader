@@ -1,6 +1,8 @@
 import threading
 import logging
+import math
 from datetime import datetime
+from numbers import Real
 from typing import Dict, Any, Optional
 
 logger = logging.getLogger("AutoTrader")
@@ -55,6 +57,35 @@ class MarketCache:
             return self._atm_strike
 
     def update_option(self, strike: int, option_type: str, data: Dict[str, Any]) -> None:
+        quote = data.copy()
+        if "last" not in quote:
+            raise ValueError(
+                f"Invalid option quote for {strike} {option_type}: "
+                "last price is required."
+            )
+
+        price_fields = ("bid", "ask", "last", "open", "high", "low", "close")
+        for field in price_fields:
+            if field not in quote:
+                continue
+            value = quote[field]
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, Real)
+                or not math.isfinite(float(value))
+                or value <= 0.0
+            ):
+                raise ValueError(
+                    f"Invalid option quote for {strike} {option_type}: "
+                    f"{field} must be a finite positive number, got {value!r}."
+                )
+
+        if "bid" in quote and "ask" in quote and quote["ask"] < quote["bid"]:
+            raise ValueError(
+                f"Invalid option quote for {strike} {option_type}: "
+                f"ask {quote['ask']!r} is below bid {quote['bid']!r}."
+            )
+
         with self._lock:
             if strike not in self._option_chain:
                 self._option_chain[strike] = {}
@@ -62,11 +93,11 @@ class MarketCache:
             # Ensure "open" is initialized to prevent calculation failures in velocity/divergence
             existing = self._option_chain[strike].get(option_type)
             if existing and existing.get("open", 0.0) > 0.0:
-                data["open"] = existing["open"]
-            elif data.get("open", 0.0) <= 0.0:
-                data["open"] = data.get("last", 0.0)
+                quote["open"] = existing["open"]
+            elif "open" not in quote:
+                quote["open"] = quote.get("last", 0.0)
 
-            self._option_chain[strike][option_type] = data
+            self._option_chain[strike][option_type] = quote
             self._last_update = datetime.now()
 
     def get_option(self, strike: int, option_type: str) -> Optional[Dict[str, Any]]:
@@ -139,6 +170,8 @@ class MarketCache:
             self._atm_strike = 0
             self._vwap = 0.0
             self._vwap_timestamp = None
+            self._last_update = None
+            self._api_latency_ms = 0
 
 # Singleton global instance
 market_cache = MarketCache()

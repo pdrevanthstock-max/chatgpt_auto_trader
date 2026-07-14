@@ -1,4 +1,5 @@
 import logging
+from datetime import datetime
 from typing import Optional
 from core.models import TradePlan, Trade
 from config.settings import TradingConfig
@@ -20,7 +21,7 @@ class ExecutionValidator:
     ) -> tuple[bool, str]:
         # 1. Daily loss cap already breached
         daily_limit = -abs(config.daily_loss_limit)
-        if realized_pnl <= daily_limit:
+        if config.execution_mode != "PAPER" and realized_pnl <= daily_limit:
             return False, f"Daily circuit breaker breached: realized PnL ₹{realized_pnl:.2f} <= ₹{daily_limit:.2f}"
 
         # 2. Position guard check (no double entries)
@@ -36,7 +37,7 @@ class ExecutionValidator:
         if not last_update:
             return False, "MarketCache is empty or has not received updates."
 
-        cache_age = (market_cache._last_update - last_update).total_seconds() if market_cache._last_update else 999
+        cache_age = (datetime.now() - last_update).total_seconds()
         if cache_age > config.health_check_cache_stale_sec:
             return False, f"MarketCache is stale: {cache_age:.1f}s age > limit {config.health_check_cache_stale_sec}s."
 
@@ -58,6 +59,18 @@ class ExecutionValidator:
 
         if ce_bid <= 0.0 or ce_ask <= 0.0 or pe_bid <= 0.0 or pe_ask <= 0.0:
             return False, "Missing bid/ask quotes for spread check."
+
+        if plan.quantity <= 0 or plan.lot_size <= 0:
+            return False, "Entry quantity and lot size must both be positive."
+
+        entry_outlay = (
+            (ce_ask + pe_ask) * plan.quantity * plan.lot_size
+        )
+        if entry_outlay > config.total_capital:
+            return False, (
+                f"Executable entry outlay ₹{entry_outlay:.2f} exceeds available "
+                f"capital ₹{config.total_capital:.2f}."
+            )
 
         ce_spread = ce_ask - ce_bid
         pe_spread = pe_ask - pe_bid

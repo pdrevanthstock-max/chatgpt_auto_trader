@@ -104,7 +104,7 @@ class ExcelExporter:
         ws_journal.views.sheetView[0].showGridLines = True
 
         headers = [
-            "Trade ID", "Direction", "CE Strike", "PE Strike", 
+            "Trade ID", "Daily SL", "Direction", "CE Strike", "PE Strike",
             "CE Entry", "PE Entry", "Entry Price (Combined)", "Qty (Lots)", "Lot Size", 
             "Regime", "Phase", "Hedge Cut Time", "Losing Leg Exit", "Losing Leg PnL", 
             "CE Exit", "PE Exit", "Exit Price (Combined)", "Exit Time", "Exit Reason", 
@@ -123,7 +123,8 @@ class ExcelExporter:
             combined_exit = (t.exit_ce_price or 0.0) + (t.exit_pe_price or 0.0) if t.exit_time else 0.0
 
             row_data = [
-                t.id,
+                getattr(t, "display_id", t.id),
+                "POST-SL" if getattr(t, "post_daily_sl", False) else "NORMAL",
                 t.direction.value,
                 t.strike_ce,
                 t.strike_pe,
@@ -152,12 +153,12 @@ class ExcelExporter:
                 cell.font = regular_font
                 
                 # Format numbers
-                if c_idx in [5, 6, 7, 13, 14, 15, 16, 17, 20, 21, 22]:
+                if c_idx in [6, 7, 8, 14, 15, 16, 17, 18, 21, 22, 23]:
                     if isinstance(val, (int, float)):
                         cell.number_format = '"₹"#,##0.00'
                 
                 # Color Net PnL green/red
-                if c_idx == 22:
+                if c_idx == 23:
                     cell.font = bold_font
                     cell.fill = green_fill if t.net_pnl >= 0 else red_fill
 

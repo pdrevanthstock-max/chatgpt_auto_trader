@@ -17,3 +17,12 @@ def test_position_sizer():
 
     # Zero price guards
     assert sizer.calculate_lots(0.0, 100.0, config) == 0
+
+
+def test_position_sizer_keeps_quantity_dynamic_for_low_premium_pair():
+    config = TradingConfig(total_capital=45000.0, nifty_lot_size=65)
+
+    lots = PositionSizer().calculate_lots(1.95, 1.90, config)
+
+    assert lots == 179
+    assert lots * config.nifty_lot_size == 11_635

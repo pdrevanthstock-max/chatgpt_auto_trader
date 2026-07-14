@@ -1,7 +1,7 @@
 import logging
 from datetime import datetime
 from typing import List, Optional
-from sqlalchemy import create_engine, Column, String, Integer, Float, DateTime
+from sqlalchemy import create_engine, Column, String, Integer, Float, DateTime, Boolean
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from config.settings import DATABASE_DIR
@@ -27,6 +27,7 @@ class DBTrade(Base):
     entry_time = Column(DateTime, nullable=True)
     regime_at_entry = Column(String(50), nullable=False)
     phase = Column(String(50), nullable=False)
+    post_daily_sl = Column(Boolean, default=False, nullable=False)
     
     hedge_cut_time = Column(DateTime, nullable=True)
     losing_leg_exit_price = Column(Float, nullable=True)
@@ -62,6 +63,8 @@ class TradeStore:
                         conn.execute(text("ALTER TABLE trades ADD COLUMN gross_pnl FLOAT DEFAULT 0.0"))
                     if "net_pnl" not in columns:
                         conn.execute(text("ALTER TABLE trades ADD COLUMN net_pnl FLOAT DEFAULT 0.0"))
+                    if "post_daily_sl" not in columns:
+                        conn.execute(text("ALTER TABLE trades ADD COLUMN post_daily_sl BOOLEAN NOT NULL DEFAULT 0"))
             logger.info("TradeStore schema migration check successful.")
         except Exception as e:
             logger.warning(f"TradeStore migration check failed (non-blocking): {e}")
@@ -87,6 +90,7 @@ class TradeStore:
             db_trade.entry_time = trade.entry_time
             db_trade.regime_at_entry = trade.regime_at_entry.value
             db_trade.phase = trade.phase.value
+            db_trade.post_daily_sl = bool(getattr(trade, "post_daily_sl", False))
             
             db_trade.hedge_cut_time = trade.hedge_cut_time
             db_trade.losing_leg_exit_price = trade.losing_leg_exit_price
@@ -126,6 +130,7 @@ class TradeStore:
                     entry_time=db_t.entry_time,
                     regime_at_entry=MarketRegime(db_t.regime_at_entry),
                     phase=TradePhase(db_t.phase),
+                    post_daily_sl=bool(getattr(db_t, "post_daily_sl", False)),
                     hedge_cut_time=db_t.hedge_cut_time,
                     losing_leg_exit_price=db_t.losing_leg_exit_price,
                     losing_leg_pnl=db_t.losing_leg_pnl,

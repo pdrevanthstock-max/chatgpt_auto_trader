@@ -2,6 +2,7 @@ import logging
 from datetime import datetime, time
 from typing import Dict, Tuple, Optional, Any
 from core.models import Trade, ScoredCandidate
+from core.transaction_costs import calculate_option_round_trip_costs
 from core.enums import MarketRegime, TradePhase
 from config.settings import TradingConfig
 from data.market_cache import market_cache
@@ -93,7 +94,15 @@ class RotationEngine:
         active_combined_premium = ce_close + pe_close
         expected_combined_change_pct = (active_ce_vel * ce_close + active_pe_vel * pe_close) / active_combined_premium
         expected_pnl = (expected_combined_change_pct / 100.0) * active_combined_premium * config.nifty_lot_size
-        active_score = expected_pnl - 103.0 - 10.0
+        estimated_costs = calculate_option_round_trip_costs(
+            entry_ce_price=ce_close,
+            entry_pe_price=pe_close,
+            exit_ce_price=ce_close,
+            exit_pe_price=pe_close,
+            lots=1,
+            lot_size=config.nifty_lot_size,
+        ).total
+        active_score = expected_pnl - estimated_costs - 10.0
 
         # Condition 1: Score hysteresis (new score > old score + 0.30)
         if top_candidate.projected_net_profit <= active_score + 0.30:

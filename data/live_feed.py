@@ -14,7 +14,7 @@ class LiveFeed:
     """
     Fetches real-time option quotes from Dhan API using the security_id_list CSV mapping
     and updates MarketCache with actual market prices and calculated synthetic spot.
-    Falls back to mock data generation in case of API or file missing errors.
+    Fails closed without generating synthetic prices when initialization fails.
     """
     def __init__(self) -> None:
         self._running = False
@@ -114,13 +114,27 @@ class LiveFeed:
             return True
 
         except Exception as e:
-            logger.error(f"LiveFeed failed initialization: {e}. Engaging Mock Fallback.")
-            self.log_to_engine(f"Initialization Failed: {e}. Engaging MOCK pricing fallback!")
+            logger.error(
+                f"LiveFeed failed initialization: {e}. "
+                "Synthetic pricing is disabled; PAPER/LIVE execution remains blocked."
+            )
+            self.log_to_engine(
+                f"Initialization failed: {e}. Synthetic pricing is disabled and "
+                "execution is blocked until the live feed recovers."
+            )
             self.fallback_engaged = True
             return False
 
     def _run(self) -> None:
         initialized = self._initialize_mapping()
+
+        if not initialized:
+            logger.error(
+                "LiveFeed stopped after initialization failure; MarketCache will "
+                "remain empty rather than use synthetic prices."
+            )
+            self._running = False
+            return
         
         # Spot price tracking
         spot = 24300.0
@@ -129,39 +143,6 @@ class LiveFeed:
             try:
                 now = datetime.now()
                 
-                if self.fallback_engaged or not initialized:
-                    # FALLBACK: Mock random-walk pricing
-                    import random
-                    spot += random.uniform(-1, 1)
-                    market_cache.update_spot(spot, now)
-                    
-                    atm = market_cache.get_atm_strike()
-                    for strike in range(atm - 250, atm + 300, 50):
-                        ce_mid = max(5.0, 150.0 - (strike - spot) * 0.5)
-                        pe_mid = max(5.0, 150.0 + (strike - spot) * 0.5)
-                        
-                        market_cache.update_option(strike, "CE", {
-                            "bid": round(ce_mid - 0.25, 2),
-                            "ask": round(ce_mid + 0.25, 2),
-                            "last": round(ce_mid, 2),
-                            "open": round(ce_mid, 2),
-                            "volume": 500,
-                            "oi": 2000,
-                            "timestamp": now
-                        })
-                        market_cache.update_option(strike, "PE", {
-                            "bid": round(pe_mid - 0.25, 2),
-                            "ask": round(pe_mid + 0.25, 2),
-                            "last": round(pe_mid, 2),
-                            "open": round(pe_mid, 2),
-                            "volume": 600,
-                            "oi": 3000,
-                            "timestamp": now
-                        })
-                    market_cache.update_health(latency_ms=10)
-                    time.sleep(5)
-                    continue
-
                 # REAL-TIME POLLING FROM DHAN
                 # Identify ATM strike based on last known spot
                 atm = int(round(spot / 50.0) * 50)

@@ -45,6 +45,15 @@ class TradingConfig:
 
     # Risk Management
     daily_loss_limit_pct: float = 0.03        # 3% of capital
+    per_trade_loss_limit_pct: float = 0.03    # 3% of equity available at entry
+    max_capital_deployment_pct: float = 0.90  # Reserve cash for costs/slippage
+    max_units_per_leg: int = 1800             # Temporary NIFTY safety ceiling
+    expiry_guard_days: int = 1                # Calendar days through expiry
+    expiry_near_atm_points: int = 50
+    live_readiness_min_paper_trades: int = 50
+    live_readiness_min_paper_days: int = 5
+    live_readiness_min_profit_factor: float = 1.20
+    live_readiness_max_drawdown_pct: float = 0.10
 
     # Trading Hours (IST)
     scan_start: str = "09:30"
@@ -71,13 +80,21 @@ class TradingConfig:
 
     # App controls
     execution_mode: str = "BACKTEST"  # BACKTEST | PAPER | LIVE
+    live_trading_enabled: bool = False  # Explicit kill switch; PAPER remains unaffected
     scan_interval_seconds: int = 120
+    risk_monitor_interval_seconds: int = 1
     backtest_from_date: str = ""
     backtest_to_date: str = ""
 
     @property
     def daily_loss_limit(self) -> float:
         return self.total_capital * self.daily_loss_limit_pct
+
+    def entry_equity(self, realized_net_pnl: float) -> float:
+        return max(0.0, round(self.total_capital + realized_net_pnl, 2))
+
+    def per_trade_loss_limit(self, entry_equity: float) -> float:
+        return round(max(0.0, entry_equity) * self.per_trade_loss_limit_pct, 2)
 
     def save(self, path: Path = None) -> None:
         path = path or CONFIG_FILE

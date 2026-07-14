@@ -2,6 +2,8 @@
 
 **Adaptive Option Pair Divergence Capture System for NIFTY**
 
+> **Current engineering handoff:** See [`docs/SYSTEM_EVOLUTION_AND_CURRENT_ARCHITECTURE_2026-07-13_TO_2026-07-14.md`](docs/SYSTEM_EVOLUTION_AND_CURRENT_ARCHITECTURE_2026-07-13_TO_2026-07-14.md) for the July 13–14 change history, current requirement precedence, pair-selection rules, execution safeguards, capital controls, test evidence, and unresolved LIVE blockers.
+
 AutoTrader v6.0.0 is a strictly modular algorithmic trading system built to capture pricing divergence between NIFTY options contracts. Rather than trying to predict market direction, the system scans the cross-strike options matrix, identifies structural imbalances, and dynamically opens, rotates, and exits hedge pairs in real-time.
 
 ---

@@ -1,7 +1,7 @@
 import threading
 import logging
 import math
-from datetime import datetime
+from datetime import date, datetime
 from numbers import Real
 from typing import Dict, Any, Optional
 
@@ -18,6 +18,7 @@ class MarketCache:
         self._spot_timestamp: Optional[datetime] = None
         
         self._atm_strike: int = 0
+        self._active_expiry: Optional[date] = None
         
         # option_chain: { strike: { "CE": {bid, ask, last, volume, oi, timestamp}, "PE": {...} } }
         self._option_chain: Dict[int, Dict[str, Dict[str, Any]]] = {}
@@ -55,6 +56,14 @@ class MarketCache:
     def get_atm_strike(self) -> int:
         with self._lock:
             return self._atm_strike
+
+    def set_active_expiry(self, expiry: date) -> None:
+        with self._lock:
+            self._active_expiry = expiry
+
+    def get_active_expiry(self) -> Optional[date]:
+        with self._lock:
+            return self._active_expiry
 
     def update_option(self, strike: int, option_type: str, data: Dict[str, Any]) -> None:
         quote = data.copy()
@@ -168,6 +177,7 @@ class MarketCache:
             self._spot_price = 0.0
             self._spot_timestamp = None
             self._atm_strike = 0
+            self._active_expiry = None
             self._vwap = 0.0
             self._vwap_timestamp = None
             self._last_update = None

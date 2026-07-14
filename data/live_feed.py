@@ -2,7 +2,7 @@ import logging
 import threading
 import time
 import pandas as pd
-from datetime import datetime, date
+from datetime import datetime
 from pathlib import Path
 from data.market_cache import market_cache
 from config.settings import DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN
@@ -16,7 +16,7 @@ class LiveFeed:
     and updates MarketCache with actual market prices and calculated synthetic spot.
     Fails closed without generating synthetic prices when initialization fails.
     """
-    def __init__(self) -> None:
+    def __init__(self, engine=None) -> None:
         self._running = False
         self._thread = None
         self.strike_map = {}
@@ -24,14 +24,11 @@ class LiveFeed:
         self.active_expiry = None
         self.fallback_engaged = False
         self.client = None
+        self.engine = engine
 
     def log_to_engine(self, message: str) -> None:
-        try:
-            import streamlit as st
-            if "live_engine" in st.session_state:
-                st.session_state["live_engine"].log_activity(f"LiveFeed: {message}")
-        except Exception:
-            pass
+        if self.engine is not None:
+            self.engine.log_activity(f"LiveFeed: {message}")
         logger.info(f"LiveFeed: {message}")
 
     def start(self) -> None:
@@ -78,16 +75,12 @@ class LiveFeed:
 
             # Determine active expiry date dynamically (earliest expiry >= today)
             today_date = datetime.now().date()
-            # Simulation target date fallback if running outside trading window
-            if today_date > date(2026, 8, 1):
-                # July 13, 2026 for simulation/testing parity
-                today_date = date(2026, 7, 13)
-
             future_expiries = sorted([d for d in df_all["expiry_parsed"].unique() if d >= today_date])
             if not future_expiries:
                 raise ValueError(f"No active expiries found in CSV >= {today_date}")
 
             self.active_expiry = future_expiries[0]
+            market_cache.set_active_expiry(self.active_expiry)
             self.log_to_engine(f"Active Expiry selected: {self.active_expiry}")
 
             expiry_df = df_all[df_all["expiry_parsed"] == self.active_expiry]
@@ -149,14 +142,9 @@ class LiveFeed:
                 
                 # Get active trade strikes from engine dynamically to guarantee live P&L updates
                 active_strikes = []
-                try:
-                    import streamlit as st
-                    if "live_engine" in st.session_state and st.session_state["live_engine"].active_trade:
-                        trade = st.session_state["live_engine"].active_trade
-                        if trade.is_open:
-                            active_strikes.extend([float(trade.strike_ce), float(trade.strike_pe)])
-                except Exception:
-                    pass
+                trade = self.engine.active_trade if self.engine is not None else None
+                if trade is not None and trade.is_open:
+                    active_strikes.extend([float(trade.strike_ce), float(trade.strike_pe)])
 
                 # Fetch closest 15 strikes (steps of 50, e.g. ATM - 350 to ATM + 350)
                 test_strikes = [float(s) for s in range(atm - 350, atm + 400, 50)]
@@ -174,7 +162,9 @@ class LiveFeed:
                     time.sleep(5)
                     continue
 
+                request_started = time.perf_counter()
                 res = self.client.quote_data({"NSE_FNO": sec_ids})
+                latency_ms = int((time.perf_counter() - request_started) * 1000)
                 
                 if res.get("status") == "success":
                     outer_data = res.get("data", {}).get("data", {})
@@ -206,8 +196,8 @@ class LiveFeed:
                             "ask": ask,
                             "last": ltp,
                             "open": open_val,
-                            "volume": v.get("volume", 500),
-                            "oi": v.get("oi", 1000),
+                            "volume": v.get("volume", 0) or 0,
+                            "oi": v.get("oi", 0) or 0,
                             "timestamp": now
                         })
                         
@@ -231,7 +221,7 @@ class LiveFeed:
                         spot = curr_atm + ce_prices[curr_atm] - pe_prices[curr_atm]
                         market_cache.update_spot(spot, now)
                         
-                    market_cache.update_health(latency_ms=15)
+                    market_cache.update_health(latency_ms=latency_ms)
                 else:
                     logger.warning(f"Dhan live quote query returned failure: {res}")
                 

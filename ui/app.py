@@ -23,6 +23,7 @@ from data.historical_loader import HistoricalLoader
 from backtest.engine import BacktestEngine
 from backtest.results import BacktestResults
 from database.trade_store import TradeStore
+from database.capital_ledger import CapitalLedger
 from reporting.excel_export import ExcelExporter
 from monitoring.health_monitor import HealthMonitor
 
@@ -38,6 +39,7 @@ from strategy.trade_planner import TradePlanner
 from strategy.position_guard import PositionGuard
 from strategy.daily_circuit_breaker import DailyCircuitBreaker
 from strategy.position_sizer import PositionSizer
+from strategy.live_readiness import evaluate_live_readiness
 from strategy.order_type_selector import OrderTypeSelector
 from strategy.exit_manager import ExitManager
 from strategy.hedge_cut_manager import HedgeCutManager
@@ -121,6 +123,8 @@ class LiveEngine:
         self.running = False
         self.thread: Optional[threading.Thread] = None
         self.config = TradingConfig.load()
+        self.session_execution_mode: Optional[str] = None
+        self.session_allocated_capital: Optional[float] = None
         
         # Thread-safe activity log list
         self._log_lock = threading.Lock()
@@ -146,14 +150,16 @@ class LiveEngine:
         self.validator = ExecutionValidator()
         self.queue = ExecutionQueue()
         self.paper_executor = PaperExecutor()
-        self.broker_executor = BrokerExecutor()
+        self.broker_executor: Optional[BrokerExecutor] = None
         self.recovery = CrashRecovery()
         self.health_monitor = HealthMonitor()
         self.store = TradeStore()
+        self.capital_ledger = CapitalLedger()
         
         # Real-time state
-        self.realized_pnl = 0.0
-        self.active_trade: Optional[Trade] = None
+        self.realized_pnl, self.active_trade = self.recovery.load_state(
+            execution_mode=self.config.execution_mode
+        )
         
         # Regime detector windows
         self.spot_closes = []
@@ -161,6 +167,7 @@ class LiveEngine:
         self.spot_lows = []
         self.vwap_values = []
         self.atr_values = []
+        self._last_entry_scan_at: Optional[datetime] = None
 
     def log_activity(self, message: str) -> None:
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -170,10 +177,64 @@ class LiveEngine:
             if len(self.activity_log) > 200:
                 self.activity_log.pop(0)
 
+    def current_strategy_equity(self) -> float:
+        base_capital = (
+            self.session_allocated_capital
+            if self.session_allocated_capital is not None
+            else self.config.total_capital
+        )
+        mode = self.session_execution_mode or self.config.execution_mode
+        if mode == ExecutionMode.PAPER.value:
+            return self.capital_ledger.paper_equity(
+                base_capital=base_capital,
+                realized_net_pnl=self.realized_pnl,
+            )
+        return max(0.0, round(base_capital + self.realized_pnl, 2))
+
     def start(self) -> None:
         if self.running:
             return
             
+        self.config = TradingConfig.load()
+        self.session_execution_mode = self.config.execution_mode
+        self.session_allocated_capital = self.config.total_capital
+        if (
+            self.session_execution_mode == ExecutionMode.LIVE.value
+            and not self.config.live_trading_enabled
+        ):
+            raise RuntimeError(
+                "LIVE trading kill switch is disabled. Complete PAPER validation and explicitly set "
+                "live_trading_enabled=true before broker orders are permitted."
+            )
+        if (
+            self.session_execution_mode == ExecutionMode.LIVE.value
+            and self.capital_ledger.is_live_daily_stop_active(date.today())
+        ):
+            raise RuntimeError(
+                "LIVE daily loss stop is latched for today. Changing the strategy allocation "
+                "cannot re-enable LIVE entries until the next trading day."
+            )
+        if self.session_execution_mode == ExecutionMode.LIVE.value:
+            readiness = evaluate_live_readiness(
+                transactions=self.capital_ledger.list_transactions("PAPER"),
+                allocation=self.session_allocated_capital,
+                min_trades=self.config.live_readiness_min_paper_trades,
+                min_days=self.config.live_readiness_min_paper_days,
+                min_profit_factor=self.config.live_readiness_min_profit_factor,
+                max_drawdown_pct=self.config.live_readiness_max_drawdown_pct,
+            )
+            if not readiness.ready:
+                raise RuntimeError(
+                    "LIVE readiness gate failed: " + "; ".join(readiness.failures)
+                )
+        if self.session_execution_mode == ExecutionMode.LIVE.value:
+            self.broker_executor = BrokerExecutor(
+                allocation_limit=self.session_allocated_capital,
+                reserve_pct=1.0 - self.config.max_capital_deployment_pct,
+            )
+        else:
+            self.broker_executor = None
+
         # Re-instantiate all strategy modules to pick up disk code modifications on startup
         self.generator = PairCandidateGenerator()
         self.liq_filter = LiquidityFilter()
@@ -193,6 +254,7 @@ class LiveEngine:
         
         with self._log_lock:
             self.activity_log.clear()
+        self._last_entry_scan_at = None
             
         self.log_activity("Clearing stale market cache data...")
         from data.market_cache import market_cache
@@ -220,6 +282,14 @@ class LiveEngine:
         logger.info("LiveEngine started background thread loop.")
 
     def stop(self) -> None:
+        if (
+            self.session_execution_mode == ExecutionMode.LIVE.value
+            and self.active_trade is not None
+            and self.active_trade.is_open
+        ):
+            raise RuntimeError(
+                "LIVE engine cannot stop while a tracked broker position is open; square off and confirm fills first."
+            )
         self.running = False
         self.recovery.save_engine_status(False)
         if self.thread:
@@ -231,11 +301,16 @@ class LiveEngine:
 
         self.log_activity("LiveEngine stopped background thread loop.")
         logger.info("LiveEngine stopped background thread loop.")
+        self.session_execution_mode = None
+        self.session_allocated_capital = None
+        self.broker_executor = None
 
     def _loop(self) -> None:
         self.log_activity("Running recovery state load...")
         # Load state from crash recovery
-        self.realized_pnl, self.active_trade = self.recovery.load_state()
+        self.realized_pnl, self.active_trade = self.recovery.load_state(
+            execution_mode=self.session_execution_mode
+        )
         if self.active_trade:
             self.log_activity(f"Crash Recovery: Recovered active trade {display_trade_id(self.active_trade)} ({self.active_trade.phase.value})")
         else:
@@ -243,7 +318,7 @@ class LiveEngine:
         
         # Start Live Feed & Queue worker
         from data.live_feed import LiveFeed
-        self.feed = LiveFeed()
+        self.feed = LiveFeed(engine=self)
         self.feed.start()
         self.log_activity("Live market-data feed initialization requested.")
         
@@ -252,9 +327,17 @@ class LiveEngine:
         
         while self.running:
             try:
-                self.config = TradingConfig.load()
+                refreshed = TradingConfig.load()
+                if refreshed.execution_mode != self.session_execution_mode:
+                    self.log_activity(
+                        f"Execution mode change to {refreshed.execution_mode} ignored while running; "
+                        f"session remains locked to {self.session_execution_mode}."
+                    )
+                refreshed.execution_mode = self.session_execution_mode
+                refreshed.total_capital = self.session_allocated_capital
+                self.config = refreshed
                 self._run_strategy_cycle()
-                time.sleep(5)  # strategy evaluates every 5 seconds
+                time.sleep(max(1, self.config.risk_monitor_interval_seconds))
             except Exception as e:
                 self.log_activity(f"Error in LiveEngine cycle: {e}")
                 logger.error(f"Error in LiveEngine background iteration: {e}")
@@ -310,24 +393,34 @@ class LiveEngine:
         # Check daily circuit breaker using combined realized PnL + active trade unrealized PnL
         current_total_pnl = self.realized_pnl
         if self.active_trade and self.active_trade.is_open:
-            current_total_pnl += self.active_trade.combined_pnl
+            current_total_pnl += self.active_trade.net_pnl
             
         breaker_hit = self.circuit_breaker.is_breaker_triggered(current_total_pnl, self.config)
+        if breaker_hit and self.session_execution_mode == ExecutionMode.LIVE.value:
+            self.capital_ledger.latch_live_daily_stop(
+                trading_day=date.today(),
+                realized_pnl=current_total_pnl,
+                loss_limit=-abs(self.config.daily_loss_limit),
+            )
 
         if self.active_trade and self.active_trade.is_open:
             ce_data = market_cache.get_option(self.active_trade.strike_ce, "CE")
             pe_data = market_cache.get_option(self.active_trade.strike_pe, "PE")
             
             if ce_data and pe_data:
-                self.active_trade.ce_current_price = ce_data["last"]
-                self.active_trade.pe_current_price = pe_data["last"]
+                self.active_trade.ce_current_price = ce_data.get("bid", ce_data["last"])
+                self.active_trade.pe_current_price = pe_data.get("bid", pe_data["last"])
                 
                 # Save updated live prices and PnL to SQLite database & recovery state
                 self.store.save_trade(self.active_trade)
-                self.recovery.save_state(self.realized_pnl, self.active_trade)
+                self.recovery.save_state(
+                    self.realized_pnl,
+                    self.active_trade,
+                    execution_mode=self.session_execution_mode,
+                )
                 
-                ce_p = ce_data["last"]
-                pe_p = pe_data["last"]
+                ce_p = ce_data.get("bid", ce_data["last"])
+                pe_p = pe_data.get("bid", pe_data["last"])
                 
                 self.log_activity(f"Active Position holding: {display_trade_id(self.active_trade)} ({self.active_trade.phase.value}). Combined PnL: ₹{self.active_trade.combined_pnl:.2f}")
                 
@@ -396,6 +489,13 @@ class LiveEngine:
                         else:
                             if regime == MarketRegime.SIDEWAYS:
                                 self._check_rotation_live(regime, ce_p, pe_p)
+                    elif self.active_trade.phase == TradePhase.PARTIAL_EXIT:
+                        self.log_activity("Partial broker exit detected. Retrying only recorded open units.")
+                        self.queue.enqueue(ExecutionSignal(
+                            type=SignalType.EXIT_BOTH,
+                            trade_id=self.active_trade.id,
+                            reason=(self.active_trade.exit_reason or ExitReason.PARTIAL_FILL_ABORT).value,
+                        ))
         else:
             # Reconcile open positions with broker to catch orphan positions in LIVE mode
             if self.config.execution_mode == ExecutionMode.LIVE.value:
@@ -403,22 +503,12 @@ class LiveEngine:
                     positions = self.broker_executor.client.get_positions()
                     active_positions = [p for p in positions if int(p.get("netQty", 0)) != 0]
                     if active_positions:
-                        self.log_activity(f"Reconciliation Alert: Found {len(active_positions)} open positions at broker with no active trade. Squaring off!")
-                        for pos in active_positions:
-                            qty = abs(int(pos.get("netQty", 0)))
-                            direction = "SELL" if int(pos.get("netQty", 0)) > 0 else "BUY"
-                            details = {
-                                "security_id": str(pos.get("securityId")),
-                                "exchange_segment": pos.get("exchangeSegment", "NSE_FNO"),
-                                "transaction_type": direction,
-                                "quantity": qty,
-                                "order_type": "MARKET",
-                                "product_type": "MARGIN",
-                                "price": 0.0
-                            }
-                            # Send order directly to client place_order
-                            self.broker_executor.client.place_order(details)
-                            self.log_activity(f"Reconciliation: Closed position {pos.get('tradingSymbol')} at broker.")
+                        self.log_activity(
+                            f"RECONCILIATION BLOCK: Broker has {len(active_positions)} untracked open positions. "
+                            "Automatic liquidation is disabled because they may be manual/unrelated positions. "
+                            "New strategy entries are blocked pending manual reconciliation."
+                        )
+                        return
                 except Exception as recon_err:
                     logger.error(f"Broker position reconciliation check failed: {recon_err}")
 
@@ -432,13 +522,26 @@ class LiveEngine:
             if breaker_hit and self.config.execution_mode != ExecutionMode.PAPER.value:
                 self.log_activity("Daily Circuit Breaker is active. Entries blocked.")
                 return
+            if (
+                self._last_entry_scan_at is not None
+                and (now - self._last_entry_scan_at).total_seconds()
+                < self.config.scan_interval_seconds
+            ):
+                return
+            self._last_entry_scan_at = now
+
             if breaker_hit:
                 self.log_activity(
                     "PAPER daily loss threshold is active. Testing continues; "
                     "new trades will be tagged -SL."
                 )
 
-            self.log_activity(f"Scanning market. Spot: {spot_price:.2f} | ATM Strike: {atm_strike} | Regime: {regime.value} ({spot_trend})")
+            next_scan = now + timedelta(seconds=self.config.scan_interval_seconds)
+            self.log_activity(
+                f"Scanning market. Spot: {spot_price:.2f} | ATM Strike: {atm_strike} | "
+                f"Regime: {regime.value} ({spot_trend}) | "
+                f"Next entry scan no earlier than {next_scan.strftime('%H:%M:%S')}."
+            )
             healthy, health_msg = self.health_monitor.check_health(self.config)
             if not healthy:
                 self.log_activity(f"Health check failed: {health_msg}. Skipping scan.")
@@ -465,7 +568,9 @@ class LiveEngine:
                 return
                 
             scanned = self.scanner.scan_candidates(filtered_candidates)
-            survivors = self.entry_signal.evaluate_signals(scanned, regime, spot_trend, self.config)
+            survivors = self.entry_signal.evaluate_signals(
+                scanned, regime, spot_trend, self.config, spot_price=spot_price
+            )
             self.log_activity(f"Divergence check: {len(survivors)} of {len(scanned)} pairs passed entry criteria.")
             
             top_candidate = self.ranker.rank_candidates(survivors, self.config)
@@ -481,6 +586,7 @@ class LiveEngine:
                         ce_entry_price,
                         pe_entry_price,
                         self.config,
+                        available_capital=self.current_strategy_equity(),
                     )
                     if qty > 0:
                         plan = self.planner.plan_trade(
@@ -495,6 +601,8 @@ class LiveEngine:
                             self.config.execution_mode == ExecutionMode.PAPER.value
                             and breaker_hit
                         )
+                        plan.risk_capital_at_entry = self.current_strategy_equity()
+                        plan.hard_stop_loss = self.config.per_trade_loss_limit(plan.risk_capital_at_entry)
                         is_valid, reason = self.validator.validate_entry(
                             plan=plan,
                             realized_pnl=self.realized_pnl,
@@ -516,6 +624,8 @@ class LiveEngine:
                 self.log_activity("No scanned pairs met entry signals.")
 
     def _check_rotation_live(self, regime: MarketRegime, ce_p: float, pe_p: float) -> None:
+        from data.market_cache import market_cache
+
         candidates = self.generator.generate_candidates()
         ce_strikes = [c[0] for c in candidates]
         pe_strikes = [c[1] for c in candidates]
@@ -529,7 +639,10 @@ class LiveEngine:
                 filtered_candidates.append((ce, pe))
                 
         scanned = self.scanner.scan_candidates(filtered_candidates)
-        survivors = self.entry_signal.evaluate_signals(scanned, regime, "SIDEWAYS", self.config)
+        spot_price, _ = market_cache.get_spot()
+        survivors = self.entry_signal.evaluate_signals(
+            scanned, regime, "SIDEWAYS", self.config, spot_price=spot_price
+        )
         top_candidate = self.ranker.rank_candidates(survivors, self.config)
 
         if top_candidate:
@@ -558,12 +671,31 @@ class LiveEngine:
 
     def _execute_signal(self, signal: ExecutionSignal) -> None:
         now = datetime.now()
-        is_live = self.config.execution_mode == ExecutionMode.LIVE.value
+        execution_mode = self.session_execution_mode or self.config.execution_mode
+        is_live = execution_mode == ExecutionMode.LIVE.value
 
         if signal.type == SignalType.ENTRY:
+            if is_live and (
+                self.capital_ledger.is_live_daily_stop_active(date.today())
+                or self.circuit_breaker.is_breaker_triggered(self.realized_pnl, self.config)
+            ):
+                self.capital_ledger.latch_live_daily_stop(
+                    date.today(),
+                    self.realized_pnl,
+                    -abs(self.config.daily_loss_limit),
+                )
+                self.log_activity("LIVE ENTRY BLOCKED: daily loss stop is latched for today.")
+                return
+            if self.active_trade is not None and self.active_trade.is_open:
+                self.log_activity(
+                    f"ENTRY BLOCKED AT EXECUTION: Trade {display_trade_id(self.active_trade)} is already active."
+                )
+                return
             plan = signal.trade_plan
+            plan.risk_capital_at_entry = self.current_strategy_equity()
+            plan.hard_stop_loss = self.config.per_trade_loss_limit(plan.risk_capital_at_entry)
             plan.post_daily_sl = (
-                self.config.execution_mode == ExecutionMode.PAPER.value
+                execution_mode == ExecutionMode.PAPER.value
                 and self.circuit_breaker.is_breaker_triggered(
                     self.realized_pnl, self.config
                 )
@@ -578,7 +710,9 @@ class LiveEngine:
 
             self.active_trade = trade
             self.store.save_trade(trade)
-            self.recovery.save_state(self.realized_pnl, trade)
+            self.recovery.save_state(
+                self.realized_pnl, trade, execution_mode=execution_mode
+            )
             self.decision_memory.log_entry(trade.id, plan)
             self.log_activity(
                 f"ENTRY SUCCESS: Position active (ID: {display_trade_id(trade)}). "
@@ -588,18 +722,36 @@ class LiveEngine:
 
         elif signal.type == SignalType.EXIT_BOTH:
             if self.active_trade and self.active_trade.is_open:
+                if signal.trade_id and signal.trade_id != self.active_trade.id:
+                    self.log_activity(
+                        f"STALE EXIT BLOCKED: Signal targets {signal.trade_id}, active trade is {self.active_trade.id}."
+                    )
+                    return
                 reason = ExitReason(signal.reason or "MANUAL")
                 self.log_activity(f"Executing EXIT order for {display_trade_id(self.active_trade)} (Reason: {reason.value})...")
                 if is_live:
                     loop = asyncio.new_event_loop()
-                    loop.run_until_complete(self.broker_executor.execute_exit_both(self.active_trade, now, reason))
+                    if self.active_trade.phase == TradePhase.PHASE_2_SINGLE_LEG:
+                        loop.run_until_complete(self.broker_executor.execute_single_leg_exit(self.active_trade, now, reason))
+                    else:
+                        loop.run_until_complete(self.broker_executor.execute_exit_both(self.active_trade, now, reason))
                     loop.close()
                 else:
-                    self.paper_executor.execute_exit_both(self.active_trade, now, reason)
+                    if self.active_trade.phase == TradePhase.PHASE_2_SINGLE_LEG:
+                        self.paper_executor.execute_single_leg_exit(self.active_trade, now, reason)
+                    else:
+                        self.paper_executor.execute_exit_both(self.active_trade, now, reason)
 
-                self.realized_pnl = round(self.realized_pnl + self.active_trade.combined_pnl, 2)
+                self.realized_pnl = round(self.realized_pnl + self.active_trade.net_pnl, 2)
+                self.capital_ledger.record_trade_pnl(
+                    execution_mode,
+                    self.active_trade.id,
+                    self.active_trade.net_pnl,
+                )
                 self.store.save_trade(self.active_trade)
-                self.recovery.save_state(self.realized_pnl, None)
+                self.recovery.save_state(
+                    self.realized_pnl, None, execution_mode=execution_mode
+                )
                 self.decision_memory.log_exit(self.active_trade.id, self.active_trade, reason.value)
                 self.log_activity(f"EXIT SUCCESS: Position closed. Combined PnL: ₹{self.active_trade.combined_pnl:.2f}. Total Session PnL: ₹{self.realized_pnl:.2f}")
                 self.active_trade = None
@@ -615,7 +767,11 @@ class LiveEngine:
                     self.paper_executor.execute_hedge_cut(self.active_trade, now)
 
                 self.store.save_trade(self.active_trade)
-                self.recovery.save_state(self.realized_pnl, self.active_trade)
+                self.recovery.save_state(
+                    self.realized_pnl,
+                    self.active_trade,
+                    execution_mode=execution_mode,
+                )
                 self.decision_memory.log_hedge_cut(
                     self.active_trade.id,
                     self.active_trade.losing_leg,
@@ -630,13 +786,27 @@ class LiveEngine:
                 self.log_activity(f"Executing ROTATION close for {display_trade_id(self.active_trade)}...")
                 if is_live:
                     loop = asyncio.new_event_loop()
-                    loop.run_until_complete(self.broker_executor.execute_exit_both(self.active_trade, now, ExitReason.ROTATION))
+                    if self.active_trade.phase == TradePhase.PHASE_2_SINGLE_LEG:
+                        loop.run_until_complete(self.broker_executor.execute_single_leg_exit(self.active_trade, now, ExitReason.ROTATION))
+                    else:
+                        loop.run_until_complete(self.broker_executor.execute_exit_both(self.active_trade, now, ExitReason.ROTATION))
                     loop.close()
                 else:
-                    self.paper_executor.execute_exit_both(self.active_trade, now, ExitReason.ROTATION)
+                    if self.active_trade.phase == TradePhase.PHASE_2_SINGLE_LEG:
+                        self.paper_executor.execute_single_leg_exit(self.active_trade, now, ExitReason.ROTATION)
+                    else:
+                        self.paper_executor.execute_exit_both(self.active_trade, now, ExitReason.ROTATION)
 
-                self.realized_pnl = round(self.realized_pnl + self.active_trade.combined_pnl, 2)
+                self.realized_pnl = round(self.realized_pnl + self.active_trade.net_pnl, 2)
+                self.capital_ledger.record_trade_pnl(
+                    execution_mode,
+                    self.active_trade.id,
+                    self.active_trade.net_pnl,
+                )
                 self.store.save_trade(self.active_trade)
+                self.recovery.save_state(
+                    self.realized_pnl, None, execution_mode=execution_mode
+                )
                 self.rotation_engine.set_cooldown(self.active_trade.strike_ce, self.active_trade.strike_pe, now, self.config)
 
                 old_id = self.active_trade.id
@@ -644,10 +814,25 @@ class LiveEngine:
                 self.log_activity(f"ROTATION CLOSE SUCCESS: Trade {old_id} closed at PnL ₹{old_pnl:.2f}.")
                 self.active_trade = None
 
+                if is_live and self.circuit_breaker.is_breaker_triggered(
+                    self.realized_pnl, self.config
+                ):
+                    self.capital_ledger.latch_live_daily_stop(
+                        date.today(),
+                        self.realized_pnl,
+                        -abs(self.config.daily_loss_limit),
+                    )
+                    self.log_activity(
+                        "LIVE ENTRY BLOCKED: daily loss stop is latched for today after rotation close."
+                    )
+                    return
+
                 # Enter new
                 plan = signal.trade_plan
+                plan.risk_capital_at_entry = self.current_strategy_equity()
+                plan.hard_stop_loss = self.config.per_trade_loss_limit(plan.risk_capital_at_entry)
                 plan.post_daily_sl = (
-                    self.config.execution_mode == ExecutionMode.PAPER.value
+                    execution_mode == ExecutionMode.PAPER.value
                     and self.circuit_breaker.is_breaker_triggered(
                         self.realized_pnl, self.config
                     )
@@ -662,7 +847,9 @@ class LiveEngine:
 
                 self.active_trade = trade
                 self.store.save_trade(trade)
-                self.recovery.save_state(self.realized_pnl, trade)
+                self.recovery.save_state(
+                    self.realized_pnl, trade, execution_mode=execution_mode
+                )
                 self.decision_memory.log_rotation(old_id, old_pnl, plan, signal.reason or "Better score")
                 self.decision_memory.log_entry(trade.id, plan)
                 self.log_activity(
@@ -674,8 +861,6 @@ class LiveEngine:
 def main():
     # Load config
     config = TradingConfig.load()
-    store = TradeStore()
-    monitor = HealthMonitor()
 
     # Initialize Singleton LiveEngine using process-level sys persistence and thread locks
     import sys
@@ -693,6 +878,8 @@ def main():
                     logger.error(f"Auto-recovery start failed on fresh server start: {e}")
                 
     engine_inst = sys._global_active_engine
+    store = engine_inst.store
+    monitor = engine_inst.health_monitor
     st.session_state["live_engine"] = engine_inst
 
     # Title Banner
@@ -712,7 +899,8 @@ def main():
     exec_mode = st.sidebar.selectbox(
         "Execution Mode",
         options=[ExecutionMode.BACKTEST.value, ExecutionMode.PAPER.value, ExecutionMode.LIVE.value],
-        index=[ExecutionMode.BACKTEST.value, ExecutionMode.PAPER.value, ExecutionMode.LIVE.value].index(config.execution_mode)
+        index=[ExecutionMode.BACKTEST.value, ExecutionMode.PAPER.value, ExecutionMode.LIVE.value].index(config.execution_mode),
+        disabled=engine_inst.running,
     )
     config.execution_mode = exec_mode
 
@@ -723,16 +911,21 @@ def main():
     if exec_mode != ExecutionMode.BACKTEST.value:
         col_start, col_stop = st.sidebar.columns(2)
         with col_start:
-            if st.button("▶️ Start Engine", disabled=engine_inst.running, use_container_width=True):
+            if st.button("▶️ Start Engine", disabled=engine_inst.running, width="stretch"):
                 try:
+                    config.save()
                     engine_inst.start()
                     st.toast("AutoTrader Live/Paper Engine started successfully!", icon="🟢")
                     st.rerun()
                 except Exception as e:
                     st.sidebar.error(f"Failed to start: {e}")
         with col_stop:
-            if st.button("⏹️ Stop Engine", disabled=not engine_inst.running, use_container_width=True):
-                engine_inst.stop()
+            if st.button("⏹️ Stop Engine", disabled=not engine_inst.running, width="stretch"):
+                try:
+                    engine_inst.stop()
+                except RuntimeError as stop_error:
+                    st.sidebar.error(str(stop_error))
+                    st.stop()
                 st.toast("AutoTrader Live/Paper Engine stopped.", icon="🛑")
                 st.rerun()
 
@@ -740,34 +933,47 @@ def main():
         st.sidebar.markdown(f"Status: **{status_text}**")
 
         st.sidebar.write("")
-        if st.sidebar.button("🧹 Reset Active Position & State", use_container_width=True):
-            if engine_inst.running:
-                engine_inst.stop()
-            
+        if st.sidebar.button("🧹 Reset Active Position & State", width="stretch"):
             # Emergency exit square-off of active trade if open
             if engine_inst.active_trade and engine_inst.active_trade.is_open:
                 st.toast("Triggering emergency square-off exit orders...", icon="🚨")
                 try:
                     now = datetime.now()
-                    if config.execution_mode == ExecutionMode.LIVE.value:
+                    if engine_inst.session_execution_mode == ExecutionMode.LIVE.value:
                         import asyncio
                         loop = asyncio.new_event_loop()
-                        loop.run_until_complete(engine_inst.broker_executor.execute_exit_both(engine_inst.active_trade, now, ExitReason.MANUAL))
+                        if engine_inst.active_trade.phase == TradePhase.PHASE_2_SINGLE_LEG:
+                            loop.run_until_complete(engine_inst.broker_executor.execute_single_leg_exit(engine_inst.active_trade, now, ExitReason.MANUAL))
+                        else:
+                            loop.run_until_complete(engine_inst.broker_executor.execute_exit_both(engine_inst.active_trade, now, ExitReason.MANUAL))
                         loop.close()
                     else:
-                        engine_inst.paper_executor.execute_exit_both(engine_inst.active_trade, now, ExitReason.MANUAL)
+                        if engine_inst.active_trade.phase == TradePhase.PHASE_2_SINGLE_LEG:
+                            engine_inst.paper_executor.execute_single_leg_exit(engine_inst.active_trade, now, ExitReason.MANUAL)
+                        else:
+                            engine_inst.paper_executor.execute_exit_both(engine_inst.active_trade, now, ExitReason.MANUAL)
                 except Exception as square_err:
                     st.sidebar.error(f"Emergency square-off failed: {square_err}")
-                
-                # Update DB record with closed manual status
-                engine_inst.active_trade.phase = TradePhase.CLOSED
-                engine_inst.active_trade.exit_time = datetime.now()
-                engine_inst.active_trade.exit_reason = ExitReason.MANUAL
+                    st.stop()
+
+                # The executors mutate state only after confirmed fills.
                 engine_inst.store.save_trade(engine_inst.active_trade)
-            
-            engine_inst.realized_pnl = 0.0
+
+            if engine_inst.running:
+                engine_inst.stop()
+
+            if engine_inst.active_trade and not engine_inst.active_trade.is_open:
+                engine_inst.capital_ledger.record_trade_pnl(
+                    engine_inst.session_execution_mode or exec_mode,
+                    engine_inst.active_trade.id,
+                    engine_inst.active_trade.net_pnl,
+                )
             engine_inst.active_trade = None
-            engine_inst.recovery.save_state(0.0, None)
+            engine_inst.recovery.save_state(
+                engine_inst.realized_pnl,
+                None,
+                execution_mode=exec_mode,
+            )
             from data.market_cache import market_cache
             market_cache.clear()
             st.toast("Active position, recovery state, and Cache wiped cleanly.", icon="🧹")
@@ -775,15 +981,152 @@ def main():
     else:
         st.sidebar.markdown("Status: **N/A (Backtest Mode)**")
 
-    # Allocation & Sizing
-    total_capital = st.sidebar.number_input(
-        "Total Capital (₹)",
-        min_value=1000.0,
-        max_value=1000000.0,
-        value=config.total_capital,
-        step=5000.0
-    )
-    config.total_capital = total_capital
+    # Allocation & Sizing. Capital can change only while stopped and flat.
+    has_open_position = bool(engine_inst.active_trade and engine_inst.active_trade.is_open)
+    capital_change_disabled = engine_inst.running or has_open_position
+
+    if exec_mode == ExecutionMode.BACKTEST.value:
+        config.total_capital = st.sidebar.number_input(
+            "Backtest Starting Capital (₹)",
+            min_value=1000.0,
+            max_value=10000000.0,
+            value=float(config.total_capital),
+            step=5000.0,
+        )
+    elif exec_mode == ExecutionMode.PAPER.value:
+        paper_equity = engine_inst.capital_ledger.paper_equity(
+            base_capital=config.total_capital,
+            realized_net_pnl=engine_inst.realized_pnl,
+        )
+        paper_adjustments = engine_inst.capital_ledger.cash_adjustment_total("PAPER")
+        st.sidebar.markdown("### PAPER Equity")
+        st.sidebar.metric("Remaining PAPER Equity", f"₹{paper_equity:,.2f}")
+        st.sidebar.caption(
+            f"Base ₹{config.total_capital:,.2f} | Trading P&L ₹{engine_inst.realized_pnl:,.2f} | "
+            f"Net deposits/withdrawals ₹{paper_adjustments:,.2f}"
+        )
+        paper_target = st.sidebar.number_input(
+            "Target PAPER Equity (₹)",
+            min_value=0.0,
+            max_value=10000000.0,
+            value=float(paper_equity),
+            step=5000.0,
+            disabled=capital_change_disabled,
+        )
+        paper_note = st.sidebar.text_input(
+            "PAPER adjustment note",
+            value="PAPER test capital adjustment",
+            disabled=capital_change_disabled,
+        )
+        if st.sidebar.button(
+            "Apply PAPER Deposit / Withdrawal",
+            disabled=capital_change_disabled or paper_target == paper_equity,
+            width="stretch",
+        ):
+            try:
+                transaction = engine_inst.capital_ledger.adjust_paper_to_target(
+                    current_equity=paper_equity,
+                    target_equity=paper_target,
+                    note=paper_note,
+                    engine_running=engine_inst.running,
+                    has_open_position=has_open_position,
+                )
+                st.sidebar.success(
+                    f"Recorded {transaction.transaction_type.value}: ₹{abs(transaction.amount):,.2f}"
+                )
+                st.rerun()
+            except ValueError as capital_error:
+                st.sidebar.error(str(capital_error))
+    else:
+        st.sidebar.markdown("### LIVE Strategy Allocation")
+        readiness = evaluate_live_readiness(
+            transactions=engine_inst.capital_ledger.list_transactions("PAPER"),
+            allocation=config.total_capital,
+            min_trades=config.live_readiness_min_paper_trades,
+            min_days=config.live_readiness_min_paper_days,
+            min_profit_factor=config.live_readiness_min_profit_factor,
+            max_drawdown_pct=config.live_readiness_max_drawdown_pct,
+        )
+        if readiness.ready:
+            st.sidebar.success("LIVE readiness evidence gate: PASS")
+        else:
+            st.sidebar.error(
+                "LIVE readiness evidence gate: BLOCKED — "
+                + "; ".join(readiness.failures)
+            )
+        profit_factor_text = (
+            "∞" if readiness.profit_factor == float("inf")
+            else f"{readiness.profit_factor:.2f}"
+        )
+        st.sidebar.caption(
+            f"Closed PAPER trades {readiness.closed_trades} | Days {readiness.trading_days} | "
+            f"Net P&L ₹{readiness.net_pnl:,.2f} | Profit factor {profit_factor_text} | "
+            f"Max drawdown ₹{readiness.max_drawdown:,.2f}. "
+            "Passing is evidence, not a guarantee of future profit."
+        )
+        st.sidebar.caption(
+            "Read-only broker balance synchronization. This application does not transfer funds. "
+            "The strategy allocation is a hard ceiling below the Dhan account balance."
+        )
+        if st.sidebar.button(
+            "Refresh Dhan Funds (Read Only)",
+            disabled=capital_change_disabled,
+            width="stretch",
+        ):
+            try:
+                from data.dhan_client import DhanClient
+
+                funds = DhanClient(orders_enabled=False).get_fund_limits()
+                broker_available = float(funds["available_balance"])
+                st.session_state["broker_available_funds"] = broker_available
+                st.sidebar.success(f"Dhan available funds: ₹{broker_available:,.2f}")
+            except Exception as funds_error:
+                st.session_state.pop("broker_available_funds", None)
+                st.sidebar.error(f"Could not refresh Dhan funds: {funds_error}")
+
+        broker_available = st.session_state.get("broker_available_funds")
+        if broker_available is None:
+            st.sidebar.warning("Refresh Dhan funds before changing LIVE allocation.")
+        else:
+            st.sidebar.metric("Broker Available (Read Only)", f"₹{broker_available:,.2f}")
+
+        live_allocation = st.sidebar.number_input(
+            "LIVE Strategy Allocation (₹)",
+            min_value=1000.0,
+            max_value=10000000.0,
+            value=float(config.total_capital),
+            step=5000.0,
+            disabled=capital_change_disabled,
+        )
+        live_note = st.sidebar.text_input(
+            "LIVE allocation note",
+            value="Strategy allocation change",
+            disabled=capital_change_disabled,
+        )
+        if st.sidebar.button(
+            "Apply LIVE Allocation",
+            disabled=(
+                capital_change_disabled
+                or broker_available is None
+                or live_allocation == config.total_capital
+            ),
+            width="stretch",
+        ):
+            try:
+                engine_inst.capital_ledger.set_live_allocation(
+                    previous_allocation=config.total_capital,
+                    new_allocation=live_allocation,
+                    broker_available_funds=broker_available,
+                    note=live_note,
+                    engine_running=engine_inst.running,
+                    has_open_position=has_open_position,
+                )
+                config.total_capital = live_allocation
+                config.save()
+                st.sidebar.success(f"LIVE allocation set to ₹{live_allocation:,.2f}.")
+                st.rerun()
+            except ValueError as allocation_error:
+                st.sidebar.error(str(allocation_error))
 
     nifty_lot = st.sidebar.number_input(
         "Nifty Lot Size",
@@ -824,8 +1167,12 @@ def main():
 
     # Dates for backtester
     st.sidebar.markdown("### 📅 Backtest Date Range")
-    default_from = date.today() - timedelta(days=35)
-    default_to = date.today() - timedelta(days=1)
+    try:
+        default_from = datetime.strptime(config.backtest_from_date, "%Y-%m-%d").date()
+        default_to = datetime.strptime(config.backtest_to_date, "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        default_from = date.today() - timedelta(days=35)
+        default_to = date.today() - timedelta(days=1)
     
     from_date = st.sidebar.date_input("From Date", default_from)
     to_date = st.sidebar.date_input("To Date", default_to)
@@ -869,7 +1216,7 @@ def main():
 
         col_run, col_status = st.columns([1, 4])
         with col_run:
-            run_btn = st.button("🚀 Run Backtest", use_container_width=True)
+            run_btn = st.button("🚀 Run Backtest", width="stretch")
 
         if run_btn:
             # Clear previous fallback state
@@ -1102,9 +1449,28 @@ def main():
                 })
             
             df_hist = pd.DataFrame(rows)
-            st.dataframe(df_hist, use_container_width=True)
+            st.dataframe(df_hist, width="stretch")
         else:
             st.info("No trades matched the selected filter mode.")
+
+        st.subheader("Capital Transaction Ledger")
+        capital_transactions = engine_inst.capital_ledger.list_transactions()
+        if capital_transactions:
+            capital_rows = []
+            for transaction in reversed(capital_transactions):
+                capital_rows.append({
+                    "Timestamp": transaction.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+                    "Mode": transaction.mode,
+                    "Transaction Type": transaction.transaction_type.value,
+                    "Amount (₹)": transaction.amount,
+                    "Note": transaction.note,
+                    "Trade / Reference ID": transaction.reference_id,
+                    "Broker Balance (₹)": transaction.broker_balance,
+                    "Allocation After (₹)": transaction.allocation_after,
+                })
+            st.dataframe(pd.DataFrame(capital_rows), width="stretch")
+        else:
+            st.info("No PAPER deposits, withdrawals, trade P&L, or LIVE allocation changes recorded yet.")
 
     # Auto-refresh UI when the engine is running to pull latest activity logs
     if getattr(engine_inst, "running", False):

@@ -90,6 +90,19 @@ def test_paper_executor_propagates_post_daily_sl_tag():
     assert trade.display_id.endswith("-SL")
 
 
+def test_paper_executor_freezes_dynamic_remaining_equity_stop_on_trade():
+    _populate_quotes()
+    config = TradingConfig(total_capital=45_000.0, per_trade_loss_limit_pct=0.03)
+    plan = _plan()
+    plan.risk_capital_at_entry = config.entry_equity(-1_350.0)
+    plan.hard_stop_loss = config.per_trade_loss_limit(plan.risk_capital_at_entry)
+
+    trade = PaperExecutor().execute_entry(plan, datetime.now())
+
+    assert trade.risk_capital_at_entry == 43_650.0
+    assert trade.hard_stop_loss == 1_309.50
+
+
 def test_sl_tag_round_trips_through_trade_store(tmp_path):
     trade = Trade(
         id="postsl01",
@@ -104,6 +117,8 @@ def test_sl_tag_round_trips_through_trade_store(tmp_path):
         regime_at_entry=MarketRegime.DIRECTIONAL,
         phase=TradePhase.PHASE_1_BOTH_LEGS,
         post_daily_sl=True,
+        risk_capital_at_entry=43_650.0,
+        hard_stop_loss=1_309.50,
     )
     store = TradeStore(str(tmp_path / "trades.db"))
 
@@ -112,6 +127,8 @@ def test_sl_tag_round_trips_through_trade_store(tmp_path):
 
     assert loaded.post_daily_sl is True
     assert loaded.display_id == "postsl01-SL"
+    assert loaded.risk_capital_at_entry == 43_650.0
+    assert loaded.hard_stop_loss == 1_309.50
 
 
 def test_trade_view_helpers_support_legacy_in_memory_trade_objects():

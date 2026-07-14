@@ -33,3 +33,31 @@ def test_exit_manager_giveback_and_target():
     # CE goes 120 -> 110, PE goes 110 -> 105 -> PnL = +15 * 65 = +975
     exit_res = manager.check_exits(trade, 110.0, 105.0, 50.0, False, config)
     assert exit_res == ExitReason.GIVEBACK
+
+
+def test_sideways_target_recovers_turnover_based_transaction_costs():
+    config = TradingConfig(giveback_pct=0.10)
+    trade = Trade(
+        direction=TradeDirection.LONG_CE,
+        strike_ce=24200,
+        strike_pe=23950,
+        entry_ce_price=13.60,
+        entry_pe_price=12.65,
+        quantity=26,
+        lot_size=65,
+        entry_time=datetime.now(),
+        regime_at_entry=MarketRegime.SIDEWAYS,
+        phase=TradePhase.PHASE_1_BOTH_LEGS,
+    )
+
+    exit_res = ExitManager().check_exits(
+        trade,
+        ce_price=14.60,
+        pe_price=13.65,
+        iv_percentile=50.0,
+        is_preclose=False,
+        config=config,
+    )
+
+    assert exit_res == ExitReason.TARGET_HIT
+    assert trade.target_pnl == pytest.approx(2425.695)

@@ -1,8 +1,9 @@
 import logging
+import math
 from datetime import datetime
-from typing import Optional
+from numbers import Real
 from core.models import TradePlan, Trade
-from core.enums import TradeDirection, ExitReason, TradePhase
+from core.enums import TradeDirection, ExitReason, TradePhase, OrderType
 from data.market_cache import market_cache
 from core.exceptions import PartialFillError
 
@@ -13,25 +14,68 @@ class PaperExecutor:
     Simulates paper execution of entry, exit, rotation, and hedge-cut orders
     using prices retrieved from MarketCache.
     """
+    @staticmethod
+    def _executable_price(data: dict | None, field: str, context: str) -> float:
+        if not data:
+            raise PartialFillError(f"{context} is unavailable: option quote is missing.")
+
+        value = data.get(field)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, Real)
+            or not math.isfinite(float(value))
+            or value <= 0.0
+        ):
+            raise PartialFillError(
+                f"{context} is unavailable: {field} must be a finite positive price."
+            )
+        return float(value)
+
+    def _buy_fill_price(
+        self,
+        data: dict | None,
+        limit_price: float | None,
+        leg: str,
+    ) -> float:
+        ask = self._executable_price(data, "ask", f"{leg} entry ask")
+        if limit_price is None:
+            return ask
+
+        if (
+            isinstance(limit_price, bool)
+            or not isinstance(limit_price, Real)
+            or not math.isfinite(float(limit_price))
+            or limit_price <= 0.0
+        ):
+            raise PartialFillError(
+                f"{leg} buy limit must be a finite positive price."
+            )
+        if ask > limit_price:
+            raise PartialFillError(
+                f"{leg} buy limit {limit_price:.2f} is below executable ask {ask:.2f}."
+            )
+        return ask
+
     def execute_entry(self, plan: TradePlan, current_time: datetime) -> Trade:
         chain = market_cache.get_option_chain()
         ce_data = chain.get(plan.scored_candidate.ce_strike, {}).get("CE")
         pe_data = chain.get(plan.scored_candidate.pe_strike, {}).get("PE")
 
-        if not ce_data or not pe_data:
-            raise PartialFillError("Option data missing from cache at entry execution.")
-
-        # Determine entry prices based on order type (LIMIT vs MARKET)
-        if plan.ce_limit_price is not None:
-            ce_price = plan.ce_limit_price
+        # PAPER buys cross the spread at the executable ask. A limit order only
+        # fills if both asks are at or below their limits; otherwise no Trade is
+        # created, preserving atomic basket behavior.
+        if plan.order_type == OrderType.LIMIT:
+            if plan.ce_limit_price is None or plan.pe_limit_price is None:
+                raise PartialFillError(
+                    "PAPER limit entry requires positive limit prices for both legs."
+                )
+            ce_price = self._buy_fill_price(ce_data, plan.ce_limit_price, "CE")
+            pe_price = self._buy_fill_price(pe_data, plan.pe_limit_price, "PE")
+        elif plan.order_type == OrderType.MARKET:
+            ce_price = self._buy_fill_price(ce_data, None, "CE")
+            pe_price = self._buy_fill_price(pe_data, None, "PE")
         else:
-            # Market order uses last price
-            ce_price = ce_data.get("last", 0.0)
-
-        if plan.pe_limit_price is not None:
-            pe_price = plan.pe_limit_price
-        else:
-            pe_price = pe_data.get("last", 0.0)
+            raise PartialFillError(f"Unsupported PAPER order type: {plan.order_type!r}.")
 
         # Build Trade Direction
         # Bullish (winning leg CE) -> buy CE + buy PE
@@ -49,13 +93,15 @@ class PaperExecutor:
             entry_time=current_time,
             regime_at_entry=plan.regime,
             phase=TradePhase.PHASE_1_BOTH_LEGS,
+            post_daily_sl=plan.post_daily_sl,
             ce_current_price=ce_price,
             pe_current_price=pe_price
         )
 
         logger.info(
-            f"PaperExecutor [ENTRY FILLED]: {trade.id} | {plan.scored_candidate.ce_strike}CE @ ₹{ce_price:.2f} "
-            f"and {plan.scored_candidate.pe_strike}PE @ ₹{pe_price:.2f}. Qty: {plan.quantity} lots."
+            f"PaperExecutor [ENTRY FILLED]: {trade.display_id} | {plan.scored_candidate.ce_strike}CE @ ₹{ce_price:.2f} "
+            f"and {plan.scored_candidate.pe_strike}PE @ ₹{pe_price:.2f}. "
+            f"Size: {trade.quantity:,} lots / {trade.units_per_leg:,} units per leg."
         )
         return trade
 
@@ -64,13 +110,8 @@ class PaperExecutor:
         ce_data = chain.get(trade.strike_ce, {}).get("CE")
         pe_data = chain.get(trade.strike_pe, {}).get("PE")
 
-        if not ce_data or not pe_data:
-            # Fallback to current stored prices if cache is empty
-            ce_exit = trade.ce_current_price
-            pe_exit = trade.pe_current_price
-        else:
-            ce_exit = ce_data.get("last", trade.ce_current_price)
-            pe_exit = pe_data.get("last", trade.pe_current_price)
+        ce_exit = self._executable_price(ce_data, "bid", "CE exit bid")
+        pe_exit = self._executable_price(pe_data, "bid", "PE exit bid")
 
         trade.exit_ce_price = ce_exit
         trade.exit_pe_price = pe_exit
@@ -79,7 +120,7 @@ class PaperExecutor:
         trade.phase = TradePhase.CLOSED
 
         logger.info(
-            f"PaperExecutor [EXIT BOTH FILLED]: {trade.id} | CE exit @ ₹{ce_exit:.2f}, PE exit @ ₹{pe_exit:.2f}. "
+            f"PaperExecutor [EXIT BOTH FILLED]: {trade.display_id} | CE exit @ ₹{ce_exit:.2f}, PE exit @ ₹{pe_exit:.2f}. "
             f"PnL: ₹{trade.combined_pnl:.2f}. Reason: {reason.value}."
         )
 
@@ -91,10 +132,11 @@ class PaperExecutor:
         losing_strike = trade.strike_pe if losing_leg == "PE" else trade.strike_ce
         leg_data = chain.get(losing_strike, {}).get(losing_leg)
 
-        if not leg_data:
-            losing_exit = trade.pe_current_price if losing_leg == "PE" else trade.ce_current_price
-        else:
-            losing_exit = leg_data.get("last", 0.0)
+        losing_exit = self._executable_price(
+            leg_data,
+            "bid",
+            f"{losing_leg} hedge-cut bid",
+        )
 
         # Book the loss on the losing leg
         entry_price = trade.entry_pe_price if losing_leg == "PE" else trade.entry_ce_price
@@ -115,7 +157,7 @@ class PaperExecutor:
         trade.phase = TradePhase.PHASE_2_SINGLE_LEG
 
         logger.info(
-            f"PaperExecutor [HEDGE CUT FILLED]: {trade.id} | Losing leg {losing_leg} cut @ ₹{losing_exit:.2f}. "
+            f"PaperExecutor [HEDGE CUT FILLED]: {trade.display_id} | Losing leg {losing_leg} cut @ ₹{losing_exit:.2f}. "
             f"Realized loss: ₹{losing_leg_pnl:.2f}. Winning leg continues open."
         )
 
@@ -125,10 +167,11 @@ class PaperExecutor:
         winning_strike = trade.strike_ce if winning_leg == "CE" else trade.strike_pe
         leg_data = chain.get(winning_strike, {}).get(winning_leg)
 
-        if not leg_data:
-            winning_exit = trade.ce_current_price if winning_leg == "CE" else trade.pe_current_price
-        else:
-            winning_exit = leg_data.get("last", 0.0)
+        winning_exit = self._executable_price(
+            leg_data,
+            "bid",
+            f"{winning_leg} single-leg exit bid",
+        )
 
         if winning_leg == "CE":
             trade.exit_ce_price = winning_exit
@@ -142,6 +185,6 @@ class PaperExecutor:
         trade.phase = TradePhase.CLOSED
 
         logger.info(
-            f"PaperExecutor [SINGLE LEG EXIT FILLED]: {trade.id} | Winning leg {winning_leg} exit @ ₹{winning_exit:.2f}. "
+            f"PaperExecutor [SINGLE LEG EXIT FILLED]: {trade.display_id} | Winning leg {winning_leg} exit @ ₹{winning_exit:.2f}. "
             f"Final Trade PnL: ₹{trade.combined_pnl:.2f}. Reason: {reason.value}."
         )

@@ -51,6 +51,7 @@ from execution.broker_executor import BrokerExecutor
 import execution.crash_recovery
 importlib.reload(execution.crash_recovery)
 from execution.crash_recovery import CrashRecovery
+from ui.trade_view import daily_sl_status, display_trade_id, units_per_leg
 
 # Setup basic logging
 logging.basicConfig(level=logging.INFO)
@@ -236,7 +237,7 @@ class LiveEngine:
         # Load state from crash recovery
         self.realized_pnl, self.active_trade = self.recovery.load_state()
         if self.active_trade:
-            self.log_activity(f"Crash Recovery: Recovered active trade {self.active_trade.id} ({self.active_trade.phase.value})")
+            self.log_activity(f"Crash Recovery: Recovered active trade {display_trade_id(self.active_trade)} ({self.active_trade.phase.value})")
         else:
             self.log_activity("Crash Recovery: No active open trade found.")
         
@@ -244,7 +245,7 @@ class LiveEngine:
         from data.live_feed import LiveFeed
         self.feed = LiveFeed()
         self.feed.start()
-        self.log_activity("Live WebSocket feed feed initialized (MOCKED).")
+        self.log_activity("Live market-data feed initialization requested.")
         
         self.queue.clear()
         self.queue.start_background_worker(self._execute_signal)
@@ -328,10 +329,10 @@ class LiveEngine:
                 ce_p = ce_data["last"]
                 pe_p = pe_data["last"]
                 
-                self.log_activity(f"Active Position holding: {self.active_trade.id} ({self.active_trade.phase.value}). Combined PnL: ₹{self.active_trade.combined_pnl:.2f}")
+                self.log_activity(f"Active Position holding: {display_trade_id(self.active_trade)} ({self.active_trade.phase.value}). Combined PnL: ₹{self.active_trade.combined_pnl:.2f}")
                 
                 # Check circuit breaker hit dynamically during active trade (protect 3% capital)
-                if breaker_hit:
+                if breaker_hit and self.config.execution_mode != ExecutionMode.PAPER.value:
                     self.log_activity("Daily loss limit breached by active trade unrealized loss. Enqueuing emergency exit!")
                     self.queue.enqueue(ExecutionSignal(
                         type=SignalType.EXIT_BOTH,
@@ -428,9 +429,14 @@ class LiveEngine:
             if last_entry_passed:
                 self.log_activity(f"Last entry time passed. Entries disabled.")
                 return
-            if breaker_hit:
+            if breaker_hit and self.config.execution_mode != ExecutionMode.PAPER.value:
                 self.log_activity("Daily Circuit Breaker is active. Entries blocked.")
                 return
+            if breaker_hit:
+                self.log_activity(
+                    "PAPER daily loss threshold is active. Testing continues; "
+                    "new trades will be tagged -SL."
+                )
 
             self.log_activity(f"Scanning market. Spot: {spot_price:.2f} | ATM Strike: {atm_strike} | Regime: {regime.value} ({spot_trend})")
             healthy, health_msg = self.health_monitor.check_health(self.config)
@@ -469,15 +475,25 @@ class LiveEngine:
                 ce_data = market_cache.get_option(top_candidate.ce_strike, "CE")
                 pe_data = market_cache.get_option(top_candidate.pe_strike, "PE")
                 if ce_data and pe_data:
-                    qty = self.sizer.calculate_lots(ce_data["last"], pe_data["last"], self.config)
+                    ce_entry_price = ce_data.get("ask", ce_data["last"])
+                    pe_entry_price = pe_data.get("ask", pe_data["last"])
+                    qty = self.sizer.calculate_lots(
+                        ce_entry_price,
+                        pe_entry_price,
+                        self.config,
+                    )
                     if qty > 0:
                         plan = self.planner.plan_trade(
                             candidate=top_candidate,
                             regime=regime,
                             quantity=qty,
-                            ce_price=ce_data["last"],
-                            pe_price=pe_data["last"],
+                            ce_price=ce_entry_price,
+                            pe_price=pe_entry_price,
                             config=self.config
+                        )
+                        plan.post_daily_sl = (
+                            self.config.execution_mode == ExecutionMode.PAPER.value
+                            and breaker_hit
                         )
                         is_valid, reason = self.validator.validate_entry(
                             plan=plan,
@@ -494,7 +510,7 @@ class LiveEngine:
                         else:
                             self.log_activity(f"Entry validation failed: {reason}")
                     else:
-                        required_prem = (ce_data["last"] + pe_data["last"]) * self.config.nifty_lot_size
+                        required_prem = (ce_entry_price + pe_entry_price) * self.config.nifty_lot_size
                         self.log_activity(f"Sizer returned 0 lots (Required: ₹{required_prem:.2f}, Capital: ₹{self.config.total_capital:.2f})")
             else:
                 self.log_activity("No scanned pairs met entry signals.")
@@ -546,6 +562,12 @@ class LiveEngine:
 
         if signal.type == SignalType.ENTRY:
             plan = signal.trade_plan
+            plan.post_daily_sl = (
+                self.config.execution_mode == ExecutionMode.PAPER.value
+                and self.circuit_breaker.is_breaker_triggered(
+                    self.realized_pnl, self.config
+                )
+            )
             self.log_activity(f"Executing ENTRY order for {plan.scored_candidate.ce_strike}CE / {plan.scored_candidate.pe_strike}PE ({plan.quantity} lots)...")
             if is_live:
                 loop = asyncio.new_event_loop()
@@ -558,12 +580,16 @@ class LiveEngine:
             self.store.save_trade(trade)
             self.recovery.save_state(self.realized_pnl, trade)
             self.decision_memory.log_entry(trade.id, plan)
-            self.log_activity(f"ENTRY SUCCESS: Position active (ID: {trade.id}). CE: ₹{trade.entry_ce_price:.2f}, PE: ₹{trade.entry_pe_price:.2f}")
+            self.log_activity(
+                f"ENTRY SUCCESS: Position active (ID: {display_trade_id(trade)}). "
+                f"CE: ₹{trade.entry_ce_price:.2f}, PE: ₹{trade.entry_pe_price:.2f}, "
+                f"Size: {trade.quantity:,} lots / {units_per_leg(trade):,} units per leg."
+            )
 
         elif signal.type == SignalType.EXIT_BOTH:
             if self.active_trade and self.active_trade.is_open:
                 reason = ExitReason(signal.reason or "MANUAL")
-                self.log_activity(f"Executing EXIT order for {self.active_trade.id} (Reason: {reason.value})...")
+                self.log_activity(f"Executing EXIT order for {display_trade_id(self.active_trade)} (Reason: {reason.value})...")
                 if is_live:
                     loop = asyncio.new_event_loop()
                     loop.run_until_complete(self.broker_executor.execute_exit_both(self.active_trade, now, reason))
@@ -580,7 +606,7 @@ class LiveEngine:
 
         elif signal.type == SignalType.HEDGE_CUT:
             if self.active_trade and self.active_trade.phase == TradePhase.PHASE_1_BOTH_LEGS:
-                self.log_activity(f"Executing HEDGE CUT order for losing leg of {self.active_trade.id}...")
+                self.log_activity(f"Executing HEDGE CUT order for losing leg of {display_trade_id(self.active_trade)}...")
                 if is_live:
                     loop = asyncio.new_event_loop()
                     loop.run_until_complete(self.broker_executor.execute_hedge_cut(self.active_trade, now))
@@ -601,7 +627,7 @@ class LiveEngine:
         elif signal.type == SignalType.ROTATION:
             if self.active_trade and self.active_trade.is_open:
                 # Close current
-                self.log_activity(f"Executing ROTATION close for {self.active_trade.id}...")
+                self.log_activity(f"Executing ROTATION close for {display_trade_id(self.active_trade)}...")
                 if is_live:
                     loop = asyncio.new_event_loop()
                     loop.run_until_complete(self.broker_executor.execute_exit_both(self.active_trade, now, ExitReason.ROTATION))
@@ -620,6 +646,12 @@ class LiveEngine:
 
                 # Enter new
                 plan = signal.trade_plan
+                plan.post_daily_sl = (
+                    self.config.execution_mode == ExecutionMode.PAPER.value
+                    and self.circuit_breaker.is_breaker_triggered(
+                        self.realized_pnl, self.config
+                    )
+                )
                 self.log_activity(f"Executing ROTATION entry for {plan.scored_candidate.ce_strike}CE / {plan.scored_candidate.pe_strike}PE ({plan.quantity} lots)...")
                 if is_live:
                     loop = asyncio.new_event_loop()
@@ -633,7 +665,11 @@ class LiveEngine:
                 self.recovery.save_state(self.realized_pnl, trade)
                 self.decision_memory.log_rotation(old_id, old_pnl, plan, signal.reason or "Better score")
                 self.decision_memory.log_entry(trade.id, plan)
-                self.log_activity(f"ROTATION ENTRY SUCCESS: Position active (ID: {trade.id}). CE: ₹{trade.entry_ce_price:.2f}, PE: ₹{trade.entry_pe_price:.2f}")
+                self.log_activity(
+                    f"ROTATION ENTRY SUCCESS: Position active (ID: {display_trade_id(trade)}). "
+                    f"CE: ₹{trade.entry_ce_price:.2f}, PE: ₹{trade.entry_pe_price:.2f}, "
+                    f"Size: {trade.quantity:,} lots / {units_per_leg(trade):,} units per leg."
+                )
 
 def main():
     # Load config
@@ -915,6 +951,14 @@ def main():
     # -------------------------------------------------------------
     with tab_live:
         st.subheader("Live Operational View")
+
+        feed = getattr(engine_inst, "feed", None)
+        if feed is not None and getattr(feed, "fallback_engaged", False):
+            st.error(
+                "⚠️ MARKET DATA FEED FAILURE: PAPER/LIVE execution is blocked. "
+                "Synthetic prices are disabled and the market cache remains empty; "
+                "restart only after restoring the Dhan feed."
+            )
         
         # Display currently-held pair
         active_trade = engine_inst.active_trade
@@ -935,7 +979,11 @@ def main():
         st.write("")
 
         if active_trade and active_trade.is_open:
-            st.info(f"⚡ Currently holding open position: {active_trade.id}")
+            st.info(
+                f"⚡ Currently holding open position: {display_trade_id(active_trade)} — "
+                f"{active_trade.quantity:,} lots | "
+                f"{units_per_leg(active_trade):,} units/leg | {daily_sl_status(active_trade)}"
+            )
             
             # Derive order execution status for each leg
             ce_status = "FILLED"
@@ -956,6 +1004,7 @@ def main():
                     <div style="background: #1e293b; padding: 15px; border-radius: 8px; border: 1px solid #3b82f6;">
                         <h4 style="margin: 0; color: #60a5fa;">CE Leg Status</h4>
                         <p style="margin: 5px 0 0 0; font-size: 1.2rem; font-weight: 700; color: white;">Strike: {active_trade.strike_ce} | Entry: ₹{active_trade.entry_ce_price:.2f}</p>
+                        <p style="margin: 5px 0 0 0; font-size: 1rem; font-weight: 700; color: #e2e8f0;">Size: {active_trade.quantity:,} lots | {units_per_leg(active_trade):,} units/leg</p>
                         <p style="margin: 5px 0 0 0; font-size: 0.95rem; color: #94a3b8;">Status: <span style="color: #60a5fa; font-weight: 700;">{ce_status}</span></p>
                     </div>
                     """,
@@ -967,6 +1016,7 @@ def main():
                     <div style="background: #1e293b; padding: 15px; border-radius: 8px; border: 1px solid #10b981;">
                         <h4 style="margin: 0; color: #34d399;">PE Leg Status</h4>
                         <p style="margin: 5px 0 0 0; font-size: 1.2rem; font-weight: 700; color: white;">Strike: {active_trade.strike_pe} | Entry: ₹{active_trade.entry_pe_price:.2f}</p>
+                        <p style="margin: 5px 0 0 0; font-size: 1rem; font-weight: 700; color: #e2e8f0;">Size: {active_trade.quantity:,} lots | {units_per_leg(active_trade):,} units/leg</p>
                         <p style="margin: 5px 0 0 0; font-size: 0.95rem; color: #94a3b8;">Status: <span style="color: #34d399; font-weight: 700;">{pe_status}</span></p>
                     </div>
                     """,
@@ -1020,8 +1070,11 @@ def main():
             rows = []
             for t in trades_to_show:
                 rows.append({
-                    "Trade ID": t.id,
+                    "Trade ID": display_trade_id(t),
+                    "Daily SL": daily_sl_status(t),
                     "Direction": t.direction.value,
+                    "Lots": t.quantity,
+                    "Units / Leg": units_per_leg(t),
                     "CE Strike": str(t.strike_ce),
                     "PE Strike": str(t.strike_pe),
                     "Entry Time": t.entry_time.strftime("%m-%d %H:%M:%S") if t.entry_time else None,

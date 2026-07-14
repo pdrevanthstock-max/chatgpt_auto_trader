@@ -31,6 +31,8 @@ class DecisionMemory:
         record = {
             "event": "ENTRY",
             "trade_id": trade_id,
+            "display_trade_id": f"{trade_id}-SL" if plan.post_daily_sl else trade_id,
+            "post_daily_sl": plan.post_daily_sl,
             "pair": f"{plan.scored_candidate.ce_strike}CE-{plan.scored_candidate.pe_strike}PE",
             "score": plan.scored_candidate.projected_net_profit,
             "confidence": plan.scored_candidate.confidence,
@@ -50,6 +52,8 @@ class DecisionMemory:
         record = {
             "event": "EXIT",
             "trade_id": trade_id,
+            "display_trade_id": getattr(trade, "display_id", trade_id),
+            "post_daily_sl": bool(getattr(trade, "post_daily_sl", False)),
             "reason": reason,
             "ce_entry": trade.entry_ce_price,
             "pe_entry": trade.entry_pe_price,

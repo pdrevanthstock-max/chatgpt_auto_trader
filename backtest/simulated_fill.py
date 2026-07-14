@@ -41,6 +41,7 @@ class SimulatedFill:
             entry_time=candle.timestamp,
             regime_at_entry=plan.regime,
             phase=TradePhase.PHASE_1_BOTH_LEGS,
+            post_daily_sl=plan.post_daily_sl,
             ce_current_price=ce_price,
             pe_current_price=pe_price
         )

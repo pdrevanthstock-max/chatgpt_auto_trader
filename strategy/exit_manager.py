@@ -1,6 +1,7 @@
 import logging
 from typing import Optional
 from core.models import Trade
+from core.transaction_costs import calculate_option_round_trip_costs
 from core.enums import ExitReason, MarketRegime, TradePhase
 from config.settings import TradingConfig
 
@@ -57,7 +58,15 @@ class ExitManager:
                 scaling_factor = 0.05
 
             combined_entry_premium = (trade.entry_ce_price + trade.entry_pe_price) * trade.quantity * trade.lot_size
-            profit_target = 103.0 + (combined_entry_premium * scaling_factor) + 8.0
+            estimated_costs = calculate_option_round_trip_costs(
+                entry_ce_price=trade.entry_ce_price,
+                entry_pe_price=trade.entry_pe_price,
+                exit_ce_price=trade.entry_ce_price,
+                exit_pe_price=trade.entry_pe_price,
+                lots=trade.quantity,
+                lot_size=trade.lot_size,
+            ).total
+            profit_target = estimated_costs + (combined_entry_premium * scaling_factor) + 8.0
 
             # Scale up during preclose window (15:00 - 15:20) by 1.5x
             if is_preclose:

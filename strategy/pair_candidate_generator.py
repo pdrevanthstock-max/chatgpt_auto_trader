@@ -2,13 +2,14 @@ import logging
 from typing import List, Tuple, Any
 from data.market_cache import market_cache
 from config.settings import TradingConfig
+from strategy.pair_templates import PairTemplateGenerator
 
 logger = logging.getLogger("AutoTrader")
 
 class PairCandidateGenerator:
     """
-    Builds the Cartesian product of available CE and PE strikes within the scan range.
-    Works for both numeric strikes (live/paper) and relative strike labels (backtesting).
+    Builds an explicit matched-ATM executable template. The wider chain remains
+    available for diagnostics, but is never exposed as a CE × PE execution matrix.
     """
     def generate_candidates(self) -> List[Tuple[Any, Any]]:
         chain = market_cache.get_option_chain()
@@ -53,9 +54,8 @@ class PairCandidateGenerator:
             if "PE" in data and data["PE"] is not None and is_within_range(strike)
         ]
 
-        candidates = []
-        for ce in ce_strikes:
-            for pe in pe_strikes:
-                candidates.append((ce, pe))
-
-        return candidates
+        common_strikes = [strike for strike in ce_strikes if strike in set(pe_strikes)]
+        spot, _ = market_cache.get_spot()
+        if "ATM" in common_strikes:
+            spot = float(atm_strike) if isinstance(atm_strike, (int, float)) else 0.0
+        return PairTemplateGenerator.matched_atm(common_strikes, float(spot or 0.0))

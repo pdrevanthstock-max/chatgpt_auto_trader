@@ -260,6 +260,7 @@ class BrokerExecutor:
             direction = TradeDirection.LONG_CE if plan.scored_candidate.winning_leg == "CE" else TradeDirection.LONG_PE
 
             trade = Trade(
+                execution_mode="LIVE",
                 direction=direction,
                 strike_ce=plan.scored_candidate.ce_strike,
                 strike_pe=plan.scored_candidate.pe_strike,

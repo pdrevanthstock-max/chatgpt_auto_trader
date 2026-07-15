@@ -34,6 +34,7 @@ class TradingConfig:
     # Entry criteria
     divergence_band_min: float = 1.0   # % change divergence lower band
     divergence_band_max: float = 5.0   # % change divergence upper band
+    directional_divergence_band_max: float = 10.0
 
     # Exit parameters (Phase 1)
     giveback_pct: float = 0.10          # 10% giveback of peak profits
@@ -50,6 +51,10 @@ class TradingConfig:
     max_units_per_leg: int = 1800             # Temporary NIFTY safety ceiling
     expiry_guard_days: int = 1                # Calendar days through expiry
     expiry_near_atm_points: int = 50
+    maximum_pair_premium_ratio: float = 2.5
+    minimum_projected_net_profit: float = 100.0
+    minimum_projected_return_pct: float = 0.25
+    projected_slippage_per_unit_per_fill: float = 0.05
     live_readiness_min_paper_trades: int = 50
     live_readiness_min_paper_days: int = 5
     live_readiness_min_profit_factor: float = 1.20
@@ -81,7 +86,7 @@ class TradingConfig:
     # App controls
     execution_mode: str = "BACKTEST"  # BACKTEST | PAPER | LIVE
     live_trading_enabled: bool = False  # Explicit kill switch; PAPER remains unaffected
-    scan_interval_seconds: int = 120
+    scan_interval_seconds: int = 60
     risk_monitor_interval_seconds: int = 1
     backtest_from_date: str = ""
     backtest_to_date: str = ""

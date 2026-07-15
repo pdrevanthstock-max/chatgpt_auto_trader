@@ -16,6 +16,7 @@ class DBTrade(Base):
     __tablename__ = "trades"
 
     id = Column(String(50), primary_key=True)
+    execution_mode = Column(String(20), default="UNKNOWN", nullable=False)
     direction = Column(String(50), nullable=False)
     strike_ce = Column(Integer, nullable=False)
     strike_pe = Column(Integer, nullable=False)
@@ -76,6 +77,8 @@ class TradeStore:
                         conn.execute(text("ALTER TABLE trades ADD COLUMN ce_open_units INTEGER"))
                     if "pe_open_units" not in columns:
                         conn.execute(text("ALTER TABLE trades ADD COLUMN pe_open_units INTEGER"))
+                    if "execution_mode" not in columns:
+                        conn.execute(text("ALTER TABLE trades ADD COLUMN execution_mode VARCHAR(20) NOT NULL DEFAULT 'UNKNOWN'"))
             logger.info("TradeStore schema migration check successful.")
         except Exception as e:
             logger.warning(f"TradeStore migration check failed (non-blocking): {e}")
@@ -92,6 +95,7 @@ class TradeStore:
                 session.add(db_trade)
 
             db_trade.direction = trade.direction.value
+            db_trade.execution_mode = str(getattr(trade, "execution_mode", "UNKNOWN")).upper()
             db_trade.strike_ce = trade.strike_ce
             db_trade.strike_pe = trade.strike_pe
             db_trade.entry_ce_price = trade.entry_ce_price
@@ -135,6 +139,7 @@ class TradeStore:
             for db_t in db_trades:
                 trade = Trade(
                     id=db_t.id,
+                    execution_mode=str(getattr(db_t, "execution_mode", "UNKNOWN") or "UNKNOWN").upper(),
                     direction=TradeDirection(db_t.direction),
                     strike_ce=db_t.strike_ce,
                     strike_pe=db_t.strike_pe,

@@ -1,9 +1,10 @@
 import logging
 from typing import List, Optional
 from core.models import CandidatePair, ScoredCandidate
-from core.transaction_costs import calculate_option_round_trip_costs
 from data.market_cache import market_cache
 from config.settings import TradingConfig
+from strategy.position_sizer import PositionSizer
+from strategy.profitability import ProfitabilityCalculator, ProfitabilityInput
 
 logger = logging.getLogger("AutoTrader")
 
@@ -12,6 +13,9 @@ class PairRanker:
     Ranks surviving candidate pairs by projected net profit after brokerage.
     Attaches a score confidence percentage to each.
     """
+    def __init__(self) -> None:
+        self.last_decisions: dict[tuple[object, object], dict[str, object]] = {}
+
     def rank_candidates(
         self,
         candidates: List[CandidatePair],
@@ -19,18 +23,22 @@ class PairRanker:
         momentum_multiplier: float = 1.0
     ) -> Optional[ScoredCandidate]:
         if not candidates:
+            self.last_decisions = {}
             return None
 
         chain = market_cache.get_option_chain()
         scored_list: List[ScoredCandidate] = []
 
-        slippage_cost = 10.0  # Rs 5 per leg average, 2 legs = Rs 10
+        self.last_decisions = {}
 
         for candidate in candidates:
             ce_data = chain.get(candidate.ce_strike, {}).get("CE")
             pe_data = chain.get(candidate.pe_strike, {}).get("PE")
 
             if not ce_data or not pe_data:
+                self.last_decisions[(candidate.ce_strike, candidate.pe_strike)] = {
+                    "result": "FAIL", "reason": "MISSING_EXECUTABLE_QUOTE"
+                }
                 continue
 
             if config.execution_mode == "BACKTEST":
@@ -44,34 +52,50 @@ class PairRanker:
             
             # Premium similarity check (maximum 10% difference as requested by user)
             if ce_price <= 0.0 or pe_price <= 0.0:
+                self.last_decisions[(candidate.ce_strike, candidate.pe_strike)] = {
+                    "result": "FAIL", "reason": "NON_POSITIVE_EXECUTABLE_PRICE"
+                }
                 continue
             
-            avg_price = (ce_price + pe_price) / 2.0
-            price_diff_pct = abs(ce_price - pe_price) / avg_price
-            if price_diff_pct > 0.10:
+            premium_ratio = max(ce_price, pe_price) / min(ce_price, pe_price)
+            if premium_ratio > config.maximum_pair_premium_ratio:
+                self.last_decisions[(candidate.ce_strike, candidate.pe_strike)] = {
+                    "result": "FAIL", "reason": "PREMIUM_RATIO_EXCEEDED"
+                }
                 continue
 
-            combined_premium = ce_price + pe_price
-
-            # Estimate combined expected move
-            expected_ce_move = candidate.ce_velocity * momentum_multiplier
-            expected_pe_move = candidate.pe_velocity * momentum_multiplier
-            
-            # Combine the relative change (expressed as % change of individual contract premiums)
-            # PnL = (ce_change_rupees + pe_change_rupees)
-            expected_combined_change_pct = (expected_ce_move * ce_price + expected_pe_move * pe_price) / combined_premium
-            expected_combined_pnl_rupees = (expected_combined_change_pct / 100.0) * combined_premium * config.nifty_lot_size
-
-            estimated_costs = calculate_option_round_trip_costs(
-                entry_ce_price=ce_price,
-                entry_pe_price=pe_price,
-                exit_ce_price=ce_price,
-                exit_pe_price=pe_price,
-                lots=1,
+            lots = PositionSizer().calculate_lots(ce_price, pe_price, config)
+            if lots <= 0:
+                self.last_decisions[(candidate.ce_strike, candidate.pe_strike)] = {
+                    "result": "FAIL", "reason": "ZERO_SAFE_QUANTITY"
+                }
+                continue
+            ce_bid = ce_data.get("bid", ce_price)
+            pe_bid = pe_data.get("bid", pe_price)
+            projected = ProfitabilityCalculator.calculate(ProfitabilityInput(
+                entry_ce_ask=ce_price,
+                entry_pe_ask=pe_price,
+                projected_ce_bid=max(0.05, ce_bid * (1.0 + candidate.ce_velocity * momentum_multiplier / 100.0)),
+                projected_pe_bid=max(0.05, pe_bid * (1.0 + candidate.pe_velocity * momentum_multiplier / 100.0)),
+                lots=lots,
                 lot_size=config.nifty_lot_size,
-            ).total
-            projected_net_profit = expected_combined_pnl_rupees - estimated_costs - slippage_cost
-            if projected_net_profit <= 0.0:
+                freeze_units=config.max_units_per_leg,
+                slippage_per_unit_per_fill=config.projected_slippage_per_unit_per_fill,
+                minimum_net_profit=config.minimum_projected_net_profit,
+                minimum_return_pct=config.minimum_projected_return_pct,
+            ))
+            projected_net_profit = projected.projected_net_pnl
+            if not projected.buffer_passed:
+                self.last_decisions[(candidate.ce_strike, candidate.pe_strike)] = {
+                    "result": "FAIL",
+                    "reason": "PROJECTED_NET_BUFFER_FAILED",
+                    "projected_gross": projected.gross_pnl,
+                    "projected_costs": projected.transaction_costs.total,
+                    "projected_slippage": projected.slippage,
+                    "projected_net": projected.projected_net_pnl,
+                    "lots": lots,
+                    "units_per_leg": projected.units_per_leg,
+                }
                 continue
 
             # Calculate confidence score (deterministic heuristics)
@@ -115,6 +139,9 @@ class PairRanker:
 
             # Filter out low confidence candidates if needed (e.g. < 70% confidence)
             if confidence < 70.0:
+                self.last_decisions[(candidate.ce_strike, candidate.pe_strike)] = {
+                    "result": "FAIL", "reason": "LOW_CONFIDENCE", "confidence": confidence
+                }
                 continue
 
             scored_list.append(ScoredCandidate(
@@ -127,6 +154,17 @@ class PairRanker:
                 projected_net_profit=round(projected_net_profit, 2),
                 confidence=round(confidence, 1)
             ))
+            self.last_decisions[(candidate.ce_strike, candidate.pe_strike)] = {
+                "result": "PASS",
+                "reason": "PROFITABILITY_BUFFER_PASSED",
+                "projected_gross": projected.gross_pnl,
+                "projected_costs": projected.transaction_costs.total,
+                "projected_slippage": projected.slippage,
+                "projected_net": projected.projected_net_pnl,
+                "lots": lots,
+                "units_per_leg": projected.units_per_leg,
+                "confidence": confidence,
+            }
 
         if not scored_list:
             return None

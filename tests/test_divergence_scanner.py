@@ -1,5 +1,6 @@
 import pytest
-from datetime import datetime
+from datetime import datetime, timedelta
+from data.candle_store import CompletedCandleStore
 from data.market_cache import market_cache
 from strategy.divergence_scanner import DivergenceScanner
 
@@ -26,3 +27,23 @@ def test_divergence_scanner_velocity_calc():
     assert pair.pe_velocity == -5.0
     assert pair.divergence == 10.0
     assert pair.winning_leg == "CE"
+
+
+def test_strict_live_scanner_uses_completed_close_to_close_velocity():
+    store = CompletedCandleStore()
+    start = datetime(2026, 7, 15, 10, 0, 5)
+    for key, first, second in [
+        ("NIFTY:24200:CE", 100.0, 105.0),
+        ("NIFTY:24200:PE", 100.0, 98.0),
+    ]:
+        store.add_tick(key, start, first)
+        store.add_tick(key, start + timedelta(minutes=1), second)
+        store.add_tick(key, start + timedelta(minutes=2), second)
+
+    result = DivergenceScanner(
+        candle_store=store, require_completed=True
+    ).scan_candidates([(24200, 24200)])
+
+    assert result[0].ce_velocity == 5.0
+    assert result[0].pe_velocity == -2.0
+    assert result[0].divergence == 7.0

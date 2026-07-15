@@ -21,7 +21,11 @@ class EntrySignal:
     ) -> List[CandidatePair]:
         survivors = []
         min_band = config.divergence_band_min
-        max_band = config.divergence_band_max
+        max_band = (
+            config.directional_divergence_band_max
+            if regime == MarketRegime.DIRECTIONAL
+            else config.divergence_band_max
+        )
 
         for candidate in candidates:
             # A less-negative option is not a winning leg. Buying both legs while

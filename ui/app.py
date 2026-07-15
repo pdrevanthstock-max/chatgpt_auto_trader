@@ -24,6 +24,9 @@ from backtest.engine import BacktestEngine
 from backtest.results import BacktestResults
 from database.trade_store import TradeStore
 from database.capital_ledger import CapitalLedger
+from application.performance_service import PerformancePeriod, PerformanceService
+from application.scan_diagnostics import build_scan_diagnostics
+from data.candle_store import completed_candles, spot_candle_key
 from reporting.excel_export import ExcelExporter
 from monitoring.health_monitor import HealthMonitor
 
@@ -35,6 +38,7 @@ import strategy.pair_ranker
 importlib.reload(strategy.pair_ranker)
 from strategy.pair_ranker import PairRanker
 from strategy.regime_detector import RegimeDetector
+from strategy.market_features import MarketFeatureCalculator
 from strategy.trade_planner import TradePlanner
 from strategy.position_guard import PositionGuard
 from strategy.daily_circuit_breaker import DailyCircuitBreaker
@@ -119,10 +123,24 @@ class LiveEngine:
     Background orchestrator loop for live/paper option divergence execution.
     Fires when user clicks 'Start' and manages execution via Thread.
     """
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        execution_mode_lock: Optional[str] = None,
+        diagnostic_capture=None,
+        index_selection=None,
+    ) -> None:
         self.running = False
+        self.execution_mode_lock = (
+            str(execution_mode_lock).upper() if execution_mode_lock else None
+        )
+        if self.execution_mode_lock not in {None, ExecutionMode.PAPER.value}:
+            raise ValueError("The web runtime supports only a PAPER execution-mode lock.")
+        self.diagnostic_capture = diagnostic_capture
+        self.index_selection = index_selection
         self.thread: Optional[threading.Thread] = None
         self.config = TradingConfig.load()
+        if self.execution_mode_lock:
+            self.config.execution_mode = self.execution_mode_lock
         self.session_execution_mode: Optional[str] = None
         self.session_allocated_capital: Optional[float] = None
         
@@ -133,7 +151,7 @@ class LiveEngine:
         # Strategy components
         self.generator = PairCandidateGenerator()
         self.liq_filter = LiquidityFilter()
-        self.scanner = DivergenceScanner()
+        self.scanner = DivergenceScanner(require_completed=True)
         self.entry_signal = EntrySignal()
         self.ranker = PairRanker()
         self.regime_detector = RegimeDetector()
@@ -168,6 +186,7 @@ class LiveEngine:
         self.vwap_values = []
         self.atr_values = []
         self._last_entry_scan_at: Optional[datetime] = None
+        self._last_entry_candle_at: Optional[datetime] = None
 
     def log_activity(self, message: str) -> None:
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -196,6 +215,8 @@ class LiveEngine:
             return
             
         self.config = TradingConfig.load()
+        if self.execution_mode_lock:
+            self.config.execution_mode = self.execution_mode_lock
         self.session_execution_mode = self.config.execution_mode
         self.session_allocated_capital = self.config.total_capital
         if (
@@ -238,7 +259,7 @@ class LiveEngine:
         # Re-instantiate all strategy modules to pick up disk code modifications on startup
         self.generator = PairCandidateGenerator()
         self.liq_filter = LiquidityFilter()
-        self.scanner = DivergenceScanner()
+        self.scanner = DivergenceScanner(require_completed=True)
         self.entry_signal = EntrySignal()
         self.ranker = PairRanker()
         self.regime_detector = RegimeDetector()
@@ -255,6 +276,7 @@ class LiveEngine:
         with self._log_lock:
             self.activity_log.clear()
         self._last_entry_scan_at = None
+        self._last_entry_candle_at = None
             
         self.log_activity("Clearing stale market cache data...")
         from data.market_cache import market_cache
@@ -367,33 +389,36 @@ class LiveEngine:
             
         atm_strike = market_cache.get_atm_strike()
 
-        # Update spot windows
-        self.spot_closes.append(spot_price)
-        self.spot_highs.append(spot_price)
-        self.spot_lows.append(spot_price)
-        self.vwap_values.append(spot_price)
-        self.atr_values.append(2.0)  # mock ATR
+        spot_candles = completed_candles.latest(spot_candle_key("NIFTY"), count=20)
+        features_ready = len(spot_candles) >= 10
+        if features_ready:
+            features = MarketFeatureCalculator.calculate(spot_candles)
+            regime, spot_trend = self.regime_detector.detect_regime(
+                spot_closes=list(features.closes),
+                spot_highs=list(features.highs),
+                spot_lows=list(features.lows),
+                vwap_values=list(features.vwap_values),
+                atr_values=list(features.atr_values),
+                atm_strike=atm_strike,
+            )
+        else:
+            regime, spot_trend = MarketRegime.SIDEWAYS, "SIDEWAYS"
 
-        if len(self.spot_closes) > 20:
-            self.spot_closes.pop(0)
-            self.spot_highs.pop(0)
-            self.spot_lows.pop(0)
-            self.vwap_values.pop(0)
-            self.atr_values.pop(0)
-
-        regime, spot_trend = self.regime_detector.detect_regime(
-            spot_closes=self.spot_closes,
-            spot_highs=self.spot_highs,
-            spot_lows=self.spot_lows,
-            vwap_values=self.vwap_values,
-            atr_values=self.atr_values,
-            atm_strike=atm_strike
+        # Scope the daily stop to the current IST trading date. Historical
+        # realized P&L remains part of equity, not today's breaker input.
+        daily_active_pnl = (
+            self.active_trade.net_pnl
+            if self.active_trade and self.active_trade.is_open
+            else 0.0
         )
-
-        # Check daily circuit breaker using combined realized PnL + active trade unrealized PnL
-        current_total_pnl = self.realized_pnl
-        if self.active_trade and self.active_trade.is_open:
-            current_total_pnl += self.active_trade.net_pnl
+        daily_performance = PerformanceService.calculate(
+            trades=self.store.get_all_trades(),
+            mode=self.session_execution_mode or self.config.execution_mode,
+            period=PerformancePeriod.TODAY,
+            now=now,
+            active_pnl=daily_active_pnl,
+        )
+        current_total_pnl = daily_performance.daily_risk_pnl
             
         breaker_hit = self.circuit_breaker.is_breaker_triggered(current_total_pnl, self.config)
         if breaker_hit and self.session_execution_mode == ExecutionMode.LIVE.value:
@@ -467,9 +492,9 @@ class LiveEngine:
                                         type=SignalType.HEDGE_CUT,
                                         trade_id=self.active_trade.id
                                     ))
-                                else:
+                                elif features_ready:
                                     self._check_rotation_live(regime, ce_p, pe_p)
-                            else:
+                            elif features_ready:
                                 self._check_rotation_live(regime, ce_p, pe_p)
                                 
                     elif self.active_trade.phase == TradePhase.PHASE_2_SINGLE_LEG:
@@ -487,7 +512,7 @@ class LiveEngine:
                                 reason=exit_res.value
                             ))
                         else:
-                            if regime == MarketRegime.SIDEWAYS:
+                            if features_ready and regime == MarketRegime.SIDEWAYS:
                                 self._check_rotation_live(regime, ce_p, pe_p)
                     elif self.active_trade.phase == TradePhase.PARTIAL_EXIT:
                         self.log_activity("Partial broker exit detected. Retrying only recorded open units.")
@@ -512,7 +537,27 @@ class LiveEngine:
                 except Exception as recon_err:
                     logger.error(f"Broker position reconciliation check failed: {recon_err}")
 
-            # Check entry conditions
+            if self.index_selection is not None:
+                selection_snapshot = self.index_selection.snapshot()
+                if selection_snapshot.pause_new_entries:
+                    self.log_activity(
+                        "Pause New Entries is active. Existing-position monitoring remains enabled."
+                    )
+                    return
+                if "NIFTY" not in selection_snapshot.symbols:
+                    self.log_activity(
+                        "NIFTY is not selected. The NIFTY entry adapter is paused."
+                    )
+                    return
+
+            # Check entry conditions. Incomplete candles are display-only and
+            # can never drive a new entry.
+            if not features_ready:
+                self.log_activity(
+                    f"Entry scan waiting for 10 completed one-minute spot candles; "
+                    f"currently {len(spot_candles)}. Active-position exits remain enabled."
+                )
+                return
             if not trading_hours:
                 self.log_activity(f"Outside trading hours (09:30-15:20). Current: {now.strftime('%H:%M:%S')}")
                 return
@@ -529,6 +574,10 @@ class LiveEngine:
             ):
                 return
             self._last_entry_scan_at = now
+            latest_spot_candle = spot_candles[-1]
+            if latest_spot_candle.timestamp == self._last_entry_candle_at:
+                return
+            self._last_entry_candle_at = latest_spot_candle.timestamp
 
             if breaker_hit:
                 self.log_activity(
@@ -574,6 +623,22 @@ class LiveEngine:
             self.log_activity(f"Divergence check: {len(survivors)} of {len(scanned)} pairs passed entry criteria.")
             
             top_candidate = self.ranker.rank_candidates(survivors, self.config)
+            if self.diagnostic_capture is not None:
+                capture_snapshot = self.diagnostic_capture.snapshot()
+                if capture_snapshot.capturing:
+                    diagnostic_rows = build_scan_diagnostics(
+                        scanned=scanned,
+                        survivors=survivors,
+                        ranker_decisions=self.ranker.last_decisions,
+                        regime=regime,
+                        spot_trend=spot_trend,
+                        config=self.config,
+                        index_symbol="NIFTY",
+                        spot_price=spot_price,
+                    )
+                    self.diagnostic_capture.record(
+                        diagnostic_rows[: capture_snapshot.top_count]
+                    )
             
             if top_candidate:
                 self.log_activity(f"Top Candidate selected: {top_candidate.ce_strike}CE-{top_candidate.pe_strike}PE (Divergence: {top_candidate.divergence:.2f}%)")
@@ -1310,19 +1375,39 @@ def main():
         # Display currently-held pair
         active_trade = engine_inst.active_trade
         
-        # 1. Performance and Daily Session P&L Calculations
-        total_pnl = engine_inst.realized_pnl
-        active_pnl = active_trade.combined_pnl if (active_trade and active_trade.is_open) else 0.0
+        # 1. Date- and mode-scoped performance; capital cash flows remain separate.
+        period_labels = {
+            "Today": PerformancePeriod.TODAY,
+            "Week": PerformancePeriod.WEEK,
+            "Month": PerformancePeriod.MONTH,
+            "Year": PerformancePeriod.YEAR,
+            "All Time": PerformancePeriod.ALL_TIME,
+        }
+        selected_period_label = st.selectbox(
+            "Performance Period",
+            options=list(period_labels),
+            index=0,
+            key="live_performance_period",
+        )
+        active_pnl = active_trade.net_pnl if (active_trade and active_trade.is_open) else 0.0
+        selected_performance = PerformanceService.calculate(
+            trades=engine_inst.store.get_all_trades(),
+            mode=engine_inst.session_execution_mode or engine_inst.config.execution_mode,
+            period=period_labels[selected_period_label],
+            now=datetime.now(),
+            active_pnl=active_pnl,
+        )
+        total_pnl = selected_performance.realized_pnl
         total_day_pnl = total_pnl + active_pnl
         
         mc1, mc2, mc3 = st.columns(3)
-        realized_color = "#10b981" if engine_inst.realized_pnl >= 0 else "#ef4444"
+        realized_color = "#10b981" if total_pnl >= 0 else "#ef4444"
         active_color = "#10b981" if active_pnl >= 0 else "#ef4444"
         total_color = "#10b981" if total_day_pnl >= 0 else "#ef4444"
         
-        mc1.markdown(f'<div class="metric-card"><div class="metric-title">Realized P&L</div><div class="metric-value" style="color: {realized_color};">₹{engine_inst.realized_pnl:,.2f}</div></div>', unsafe_allow_html=True)
+        mc1.markdown(f'<div class="metric-card"><div class="metric-title">{selected_period_label} Realized P&L</div><div class="metric-value" style="color: {realized_color};">₹{total_pnl:,.2f}</div></div>', unsafe_allow_html=True)
         mc2.markdown(f'<div class="metric-card"><div class="metric-title">Active Position P&L</div><div class="metric-value" style="color: {active_color};">₹{active_pnl:,.2f}</div></div>', unsafe_allow_html=True)
-        mc3.markdown(f'<div class="metric-card"><div class="metric-title">Total Day P&L</div><div class="metric-value" style="color: {total_color};">₹{total_day_pnl:,.2f}</div></div>', unsafe_allow_html=True)
+        mc3.markdown(f'<div class="metric-card"><div class="metric-title">{selected_period_label} Total P&L</div><div class="metric-value" style="color: {total_color};">₹{total_day_pnl:,.2f}</div></div>', unsafe_allow_html=True)
         st.write("")
 
         if active_trade and active_trade.is_open:

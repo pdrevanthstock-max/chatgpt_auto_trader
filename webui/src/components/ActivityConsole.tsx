@@ -1,0 +1,3 @@
+export function ActivityConsole({ events, connected = false }: { events: string[]; connected?: boolean }) {
+  return <section className="panel" aria-labelledby="console-title"><div className="panel-heading"><div><p className="eyebrow">Runtime</p><h2 id="console-title">Activity console</h2></div><span className={connected ? "status active" : "status paused"}>{connected ? "Live stream" : "Reconnecting"}</span></div><div className="console" role="log">{events.length ? events.map((event, index) => <p key={`${event}-${index}`}>{event}</p>) : <p>No engine events yet.</p>}</div><p className="hint">Server-authoritative WebSocket snapshots refresh runtime, positions, diagnostics, and logs every second.</p></section>;
+}

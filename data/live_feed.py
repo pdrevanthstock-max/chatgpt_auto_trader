@@ -7,6 +7,8 @@ from pathlib import Path
 from data.market_cache import market_cache
 from config.settings import DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN
 from dhanhq import DhanContext, dhanhq
+from data.market_response import RetryPolicy
+from data.candle_store import completed_candles, option_candle_key, spot_candle_key
 
 logger = logging.getLogger("AutoTrader")
 
@@ -25,6 +27,7 @@ class LiveFeed:
         self.fallback_engaged = False
         self.client = None
         self.engine = engine
+        self.quote_retry_policy = RetryPolicy(max_attempts=3, base_delay_seconds=0.5)
 
     def log_to_engine(self, message: str) -> None:
         if self.engine is not None:
@@ -43,6 +46,24 @@ class LiveFeed:
         if self._thread:
             self._thread.join(timeout=3)
         logger.info("Live Feed connection stopped")
+
+    def _fetch_quotes(self, security_ids: list[int], correlation_id: str) -> dict | None:
+        """Fetch a quote batch with typed, bounded, fail-closed retries."""
+        result = self.quote_retry_policy.run(
+            lambda: self.client.quote_data({"NSE_FNO": security_ids}),
+            endpoint="quote_data",
+            correlation_id=correlation_id,
+        )
+        if not result.ok:
+            self.fallback_engaged = True
+            code = result.error_code.value if result.error_code else "UNKNOWN"
+            self.log_to_engine(
+                f"Quote batch blocked after {result.attempt_count} attempt(s): "
+                f"{code}. {result.message} Correlation: {correlation_id}."
+            )
+            return None
+        self.fallback_engaged = False
+        return result.value
 
     def _initialize_mapping(self) -> bool:
         """Loads F&O option security mappings from CSV."""
@@ -163,8 +184,12 @@ class LiveFeed:
                     continue
 
                 request_started = time.perf_counter()
-                res = self.client.quote_data({"NSE_FNO": sec_ids})
+                correlation_id = f"quote-{now.strftime('%Y%m%d-%H%M%S')}"
+                res = self._fetch_quotes(sec_ids, correlation_id=correlation_id)
                 latency_ms = int((time.perf_counter() - request_started) * 1000)
+                if res is None:
+                    time.sleep(5)
+                    continue
                 
                 if res.get("status") == "success":
                     outer_data = res.get("data", {}).get("data", {})
@@ -200,6 +225,13 @@ class LiveFeed:
                             "oi": v.get("oi", 0) or 0,
                             "timestamp": now
                         })
+                        completed_candles.add_tick(
+                            option_candle_key("NIFTY", strike, opt_type),
+                            now,
+                            float(ltp),
+                            volume=int(v.get("volume", 0) or 0),
+                            oi=int(v.get("oi", 0) or 0),
+                        )
                         
                         if opt_type == "CE":
                             ce_prices[strike] = ltp
@@ -220,6 +252,9 @@ class LiveFeed:
                         # Synthetic Nifty spot calculation
                         spot = curr_atm + ce_prices[curr_atm] - pe_prices[curr_atm]
                         market_cache.update_spot(spot, now)
+                        completed_candles.add_tick(
+                            spot_candle_key("NIFTY"), now, float(spot)
+                        )
                         
                     market_cache.update_health(latency_ms=latency_ms)
                 else:

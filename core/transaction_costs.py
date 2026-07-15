@@ -42,6 +42,7 @@ def calculate_option_round_trip_costs(
     exit_pe_price: float,
     lots: int,
     lot_size: int,
+    executed_order_count: int = 4,
 ) -> OptionCostBreakdown:
     """Estimate all-in costs for two option buys followed by two option sells."""
     if lots <= 0 or lot_size <= 0:
@@ -56,7 +57,9 @@ def calculate_option_round_trip_costs(
     sell_turnover = (exit_ce_price + exit_pe_price) * units_per_leg
     total_turnover = buy_turnover + sell_turnover
 
-    brokerage = DHAN_BROKERAGE_PER_OPTION_ORDER * 4
+    if executed_order_count < 0:
+        raise ValueError("executed_order_count cannot be negative.")
+    brokerage = DHAN_BROKERAGE_PER_OPTION_ORDER * executed_order_count
     exchange_charge = total_turnover * NSE_OPTION_TRANSACTION_RATE
     stt = sell_turnover * OPTION_STT_SELL_RATE
     sebi_fee = total_turnover * SEBI_TURNOVER_RATE

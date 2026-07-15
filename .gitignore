@@ -8,6 +8,12 @@ database/*.db
 database/*.json
 reports/
 cache/
+.pytest-tmp/
+.pytest-run-*/
+webui/node_modules/
+webui/dist/
+webui/tsconfig.tsbuildinfo
+logs/*.log
 
 # Config is tracked (it's the user's settings)
 # config.json — intentionally NOT gitignored

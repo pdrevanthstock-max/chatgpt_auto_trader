@@ -41,6 +41,14 @@ def test_trade_journal_displays_capital_transactions_separately_from_trading_pnl
 
     assert 'st.subheader("Capital Transaction Ledger")' in app_source
     assert "capital_ledger.list_transactions()" in app_source
+
+
+def test_live_view_and_daily_breaker_use_date_scoped_performance_service():
+    app_source = Path("ui/app.py").read_text(encoding="utf-8")
+
+    assert "from application.performance_service import" in app_source
+    assert "current_total_pnl = daily_performance.daily_risk_pnl" in app_source
+    assert "total_pnl = selected_performance.realized_pnl" in app_source
     assert '"Transaction Type": transaction.transaction_type.value' in app_source
     assert '"Allocation After (₹)": transaction.allocation_after' in app_source
 

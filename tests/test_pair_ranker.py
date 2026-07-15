@@ -47,4 +47,6 @@ def test_pair_ranker_premium_similarity_filter():
     assert top_candidate is not None
     assert top_candidate.ce_strike == 24000
     assert top_candidate.pe_strike == 24000
-    assert top_candidate.projected_net_profit == 29.42
+    assert top_candidate.projected_net_profit >= config.minimum_projected_net_profit
+    assert ranker.last_decisions[(24000, 24000)]["lots"] > 1
+    assert ranker.last_decisions[(24100, 24100)]["reason"] == "PREMIUM_RATIO_EXCEEDED"

@@ -1,5 +1,15 @@
 # AutoTrader v6.0.0
 
+## New modular web UI (PAPER validation build)
+
+The replacement UI runs independently of Streamlit and binds to localhost:
+
+```powershell
+.\run_web_app.bat
+```
+
+Open `http://127.0.0.1:8000`. The current migration slice provides the typed FastAPI boundary and runtime All/one/many/Pause index selection. Streamlit remains available during PAPER parity work and must not be retired until the remaining performance, diagnostics, position, journal, capital, and failure-path views are verified.
+
 **Adaptive Option Pair Divergence Capture System for NIFTY**
 
 > **Current engineering handoff:** See [`docs/SYSTEM_EVOLUTION_AND_CURRENT_ARCHITECTURE_2026-07-13_TO_2026-07-14.md`](docs/SYSTEM_EVOLUTION_AND_CURRENT_ARCHITECTURE_2026-07-13_TO_2026-07-14.md) for the July 13–14 change history, current requirement precedence, pair-selection rules, execution safeguards, capital controls, test evidence, and unresolved LIVE blockers.

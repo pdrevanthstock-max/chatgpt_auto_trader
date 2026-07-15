@@ -17,6 +17,7 @@ class Candle:
     close: float
     volume: int = 0
     oi: int = 0
+    vwap: float = 0.0
     strike: float = 0.0
     spot: float = 0.0
 
@@ -87,6 +88,7 @@ class TradePlan:
 class Trade:
     """Tracks the lifecycle of an active or closed trade."""
     id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
+    execution_mode: str = "UNKNOWN"
     direction: TradeDirection = TradeDirection.LONG_CE
     strike_ce: int = 0
     strike_pe: int = 0

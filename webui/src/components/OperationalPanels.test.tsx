@@ -13,13 +13,14 @@ describe("operational dashboard panels", () => {
   it("starts and stops only the server-authoritative PAPER runtime", async () => {
     const onStart = vi.fn();
     const onStop = vi.fn();
-    const { rerender } = render(<EngineControls runtime={{ state: "STOPPED", execution_mode: "PAPER", has_active_position: false, activity: [] }} onStart={onStart} onStop={onStop} />);
+    const { rerender } = render(<EngineControls runtime={{ state: "STOPPED", execution_mode: "PAPER", has_active_position: false, activity: [], market_phase: "PREMARKET_IDLE", market_status: "Premarket idle.", seconds_to_next_phase: 2200 }} onStart={onStart} onStop={onStop} />);
     await userEvent.click(screen.getByRole("button", { name: /Start PAPER engine/i }));
     expect(onStart).toHaveBeenCalledTimes(1);
 
-    rerender(<EngineControls runtime={{ state: "RUNNING", execution_mode: "PAPER", has_active_position: false, activity: [] }} onStart={onStart} onStop={onStop} />);
+    rerender(<EngineControls runtime={{ state: "RUNNING", execution_mode: "PAPER", has_active_position: false, activity: [], market_phase: "ENTRY_WINDOW", market_status: "PAPER entry window is active.", seconds_to_next_phase: 20400 }} onStart={onStart} onStop={onStop} />);
     await userEvent.click(screen.getByRole("button", { name: /Stop engine/i }));
     expect(onStop).toHaveBeenCalledTimes(1);
+    expect(screen.getByText(/PAPER entry window is active/i)).toBeInTheDocument();
   });
   it("changes the P&L period and displays separate realized and active values", async () => {
     const onPeriodChange = vi.fn();
@@ -37,7 +38,7 @@ describe("operational dashboard panels", () => {
 
   it("makes lots and units prominent and does not invent unavailable marks", () => {
     render(<ActivePosition position={{
-      trade_id: "paper-1", execution_mode: "PAPER", direction: "LONG_CE", regime: "DIRECTIONAL",
+      trade_id: "paper-1", execution_mode: "PAPER", index_symbol: "BANKNIFTY", direction: "LONG_CE", regime: "DIRECTIONAL",
       phase: "PHASE_1_BOTH_LEGS", ce_strike: 24200, pe_strike: 24200, ce_entry: 100, pe_entry: 98,
       ce_exit: null, pe_exit: null, lots: 2, lot_size: 65, units_per_leg: 130,
       entry_time: "2026-07-15T10:00:00", exit_time: null, exit_reason: null, gross_pnl: 0,
@@ -46,6 +47,7 @@ describe("operational dashboard panels", () => {
     }} />);
 
     expect(screen.getByText("2 lots")).toBeInTheDocument();
+    expect(screen.getByText("BANKNIFTY")).toBeInTheDocument();
     expect(screen.getByText("130 units / leg")).toBeInTheDocument();
     expect(screen.getByText(/Live mark unavailable/i)).toBeInTheDocument();
   });
@@ -67,13 +69,14 @@ describe("operational dashboard panels", () => {
 
   it("renders journal quantity and net result", () => {
     render(<TradeJournal trades={[{
-      trade_id: "closed-1", execution_mode: "PAPER", direction: "LONG_CE", regime: "DIRECTIONAL",
+      trade_id: "closed-1", execution_mode: "PAPER", index_symbol: "FINNIFTY", direction: "LONG_CE", regime: "DIRECTIONAL",
       phase: "CLOSED", ce_strike: 24200, pe_strike: 24200, ce_entry: 100, pe_entry: 98,
       ce_exit: 110, pe_exit: 97, lots: 3, lot_size: 65, units_per_leg: 195,
       entry_time: "2026-07-15T10:00:00", exit_time: "2026-07-15T10:05:00", exit_reason: "TARGET_HIT",
       gross_pnl: 1755, transaction_costs: 120, net_pnl: 1635, hard_stop_loss: 900, post_daily_sl: false
     }]} />);
     expect(screen.getByText("3 / 195")).toBeInTheDocument();
+    expect(screen.getByText("FINNIFTY")).toBeInTheDocument();
     expect(screen.getByText("₹1,635.00")).toBeInTheDocument();
   });
 

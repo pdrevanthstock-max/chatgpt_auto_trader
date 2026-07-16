@@ -17,6 +17,8 @@ class IndexSpec:
     display_name: str
     lot_size: int
     permission: IndexPermission
+    strike_step: int
+    underlying_security_id: int
     metadata_requires_runtime_validation: bool = True
     runtime_connected: bool = False
 
@@ -36,13 +38,25 @@ class IndexRegistry:
         # The live instrument master must validate/override them before execution.
         return cls({
             "NIFTY": IndexSpec(
-                "NIFTY", "NIFTY 50", 65, IndexPermission.TRADABLE,
+                "NIFTY", "NIFTY 50", 65, IndexPermission.TRADABLE, 50, 13,
                 runtime_connected=True,
             ),
-            "BANKNIFTY": IndexSpec("BANKNIFTY", "NIFTY Bank", 30, IndexPermission.TRADABLE),
-            "FINNIFTY": IndexSpec("FINNIFTY", "NIFTY Financial Services", 60, IndexPermission.TRADABLE),
-            "MIDCPNIFTY": IndexSpec("MIDCPNIFTY", "NIFTY Midcap Select", 120, IndexPermission.OBSERVE_ONLY),
-            "NIFTYNXT50": IndexSpec("NIFTYNXT50", "NIFTY Next 50", 25, IndexPermission.OBSERVE_ONLY),
+            "BANKNIFTY": IndexSpec(
+                "BANKNIFTY", "NIFTY Bank", 30, IndexPermission.TRADABLE, 100, 25,
+                runtime_connected=True,
+            ),
+            "FINNIFTY": IndexSpec(
+                "FINNIFTY", "NIFTY Financial Services", 60,
+                IndexPermission.TRADABLE, 100, 27, runtime_connected=True,
+            ),
+            "MIDCPNIFTY": IndexSpec(
+                "MIDCPNIFTY", "NIFTY Midcap Select", 120,
+                IndexPermission.OBSERVE_ONLY, 25, 442, runtime_connected=True,
+            ),
+            "NIFTYNXT50": IndexSpec(
+                "NIFTYNXT50", "NIFTY Next 50", 25,
+                IndexPermission.OBSERVE_ONLY, 100, 38, runtime_connected=True,
+            ),
         })
 
     @property

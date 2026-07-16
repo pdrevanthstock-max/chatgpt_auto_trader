@@ -22,6 +22,7 @@ def trade(*, trade_id: str, when: datetime, pnl_prices: tuple[float, float], pha
     return Trade(
         id=trade_id,
         execution_mode="PAPER",
+        index_symbol="BANKNIFTY",
         direction=TradeDirection.LONG_CE,
         strike_ce=24_200,
         strike_pe=24_200,
@@ -75,11 +76,13 @@ def test_active_position_and_journal_expose_lots_units_and_price_freshness(tmp_p
     journal = client.get("/api/trades", params={"mode": "PAPER"}).json()
 
     assert position["trade_id"] == "open"
+    assert position["index_symbol"] == "BANKNIFTY"
     assert position["lots"] == 2
     assert position["units_per_leg"] == 130
     assert position["mark_to_market_available"] is False
     assert position["active_pnl"] is None
     assert journal[0]["lots"] == 2
+    assert journal[0]["index_symbol"] == "BANKNIFTY"
     assert journal[0]["units_per_leg"] == 130
 
 

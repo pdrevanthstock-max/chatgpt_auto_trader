@@ -8,7 +8,62 @@ The replacement UI runs independently of Streamlit and binds to localhost:
 .\run_web_app.bat
 ```
 
-Open `http://127.0.0.1:8000`. The current migration slice provides the typed FastAPI boundary and runtime All/one/many/Pause index selection. Streamlit remains available during PAPER parity work and must not be retired until the remaining performance, diagnostics, position, journal, capital, and failure-path views are verified.
+Open `http://127.0.0.1:8000`. This FastAPI/React application is the authoritative UI for PAPER validation. It provides engine controls, runtime index selection, period P&L, active-position quantity and marks, diagnostics capture/downloads, activity streaming, journal history, and audited PAPER capital adjustments.
+
+The Streamlit application remains available only as a legacy compatibility surface. Do not run both UIs during normal PAPER testing because the FastAPI process owns the server-authoritative web runtime. Streamlit retirement requires a separate user-approved decommission decision.
+
+### Start automatically after Windows sign-in
+
+Install the current-user scheduled task once from PowerShell:
+
+```powershell
+.\scripts\install_startup_task.ps1
+```
+
+The task is named `AutoTrader Web UI`, starts after this user's Windows logon, and keeps the local service available at `http://127.0.0.1:8000`. It starts only FastAPI/React: the trading engine remains stopped, LIVE remains disabled, and no broker order is submitted automatically.
+
+Remove the automatic-start task with:
+
+```powershell
+.\scripts\uninstall_startup_task.ps1
+```
+
+Latest launcher logs are stored under `logs/web-app-launcher.log`, `logs/web-app-service.log`, and `logs/web-app-service-error.log`.
+
+Manual service controls from PowerShell:
+
+```powershell
+Start-ScheduledTask -TaskName "AutoTrader Web UI"
+.\scripts\stop_web_app.ps1
+Get-ScheduledTask -TaskName "AutoTrader Web UI"
+Get-ScheduledTaskInfo -TaskName "AutoTrader Web UI"
+```
+
+The guarded stop script terminates both the task supervisor and its verified Uvicorn child. It therefore stops risk
+monitoring. Never run it while the dashboard reports an active position. Use the dashboard's **Stop engine** control
+first; that control refuses to stop while a position is open. For a copyable engine trace, use:
+
+```powershell
+Get-Content .\logs\engine-activity.log -Tail 200 -Wait
+Get-Content .\logs\web-app-service-error.log -Tail 200 -Wait
+```
+
+The launcher supervises unexpected Uvicorn exits and retries after five seconds. It deliberately does **not**
+automatically restart the trading engine: after a backend crash, inspect recovery state and explicitly start the PAPER
+engine from the UI. If only the browser fails while the API remains healthy, the backend continues running; validate
+it with `Invoke-RestMethod http://127.0.0.1:8000/api/runtime`.
+
+### PAPER market-day phases
+
+- Before `09:05` IST: premarket idle, with a status heartbeat no more than once per ten minutes.
+- `09:05`–`09:15`: startup countdown.
+- `09:15`–`09:30`: feed and completed-candle observation warm-up; new entries remain disabled.
+- `09:30`–`15:10`: entry window; scans remain limited to completed candles and the configured 60-second interval.
+- After `15:10`: no new entries. Open-position risk and exits continue on the one-second loop through square-off.
+
+The production entry adapter currently trades only NIFTY. BANKNIFTY and FINNIFTY are approved registry targets but
+their feeds are not connected; MIDCPNIFTY and NIFTYNXT50 are observe-only and also feed-pending. Checkbox selection
+does not override those runtime boundaries.
 
 **Adaptive Option Pair Divergence Capture System for NIFTY**
 
@@ -126,12 +181,15 @@ DHAN_CLIENT_ID=your_id
 DHAN_ACCESS_TOKEN=your_token
 ```
 
-### 3. Launch App Dashboard
-Run the command launcher from your terminal:
-```bash
-python -m streamlit run ui/app.py
+### 3. Launch the authoritative PAPER dashboard
+
+Run:
+
+```powershell
+.\run_web_app.bat
 ```
-Or double-click [run_app.bat](file:///c:/Users/LENOVO/Desktop/New%20folder%20(3)/AutoTrader-alpha/run_app.bat) (on Windows).
+
+Then open `http://127.0.0.1:8000`. The legacy Streamlit UI is not the normal operational entry point.
 
 ### 4. Run Test Suite
 Validate strategy math and queue routines:

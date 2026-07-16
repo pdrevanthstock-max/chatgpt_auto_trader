@@ -20,8 +20,10 @@ def test_health_and_default_index_universe():
     }
     readiness = {row["symbol"]: row["runtime_connected"] for row in body["indices"]}
     assert readiness["NIFTY"] is True
-    assert readiness["BANKNIFTY"] is False
-    assert readiness["FINNIFTY"] is False
+    assert readiness["BANKNIFTY"] is True
+    assert readiness["FINNIFTY"] is True
+    assert readiness["MIDCPNIFTY"] is True
+    assert readiness["NIFTYNXT50"] is True
 
 
 def test_runtime_selection_supports_one_many_and_pause():

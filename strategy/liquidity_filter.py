@@ -1,19 +1,25 @@
 import logging
 from typing import List, Any
-from data.market_cache import market_cache
+from data.market_cache import MarketCache, market_cache
 from config.settings import TradingConfig
+from core.execution_quality import leg_spread_is_within_emergency_limit
 
 logger = logging.getLogger("AutoTrader")
 
 class LiquidityFilter:
     """
-    Filters individual strikes for liquidity BEFORE candidate generation.
-    Checks volume, OI, and bid-ask spreads.
+    Filters contracts that cannot be executed safely before candidate generation.
+
+    Live volume and OI are intentionally not hard blockers. They remain ranking
+    signals because their scale varies by index, strike, expiry and time of day.
     """
+    def __init__(self, cache: MarketCache | None = None) -> None:
+        self.cache = cache or market_cache
+
     def filter_strikes(self, strikes: List[Any], option_type: str, config: TradingConfig) -> List[Any]:
         filtered = []
         is_backtest = config.execution_mode == "BACKTEST"
-        chain = market_cache.get_option_chain()
+        chain = self.cache.get_option_chain()
 
         for strike in strikes:
             opt_data = chain.get(strike, {}).get(option_type)
@@ -21,7 +27,6 @@ class LiquidityFilter:
                 continue
 
             volume = opt_data.get("volume", 0)
-            oi = opt_data.get("oi", 0)
             
             # Backtest mode applies volume-only gate (no OI/spreads historically)
             if is_backtest:
@@ -29,16 +34,13 @@ class LiquidityFilter:
                 if volume >= 5:
                     filtered.append(strike)
             else:
-                # Live / Paper mode check
-                bid = opt_data.get("bid", 0.0)
-                ask = opt_data.get("ask", 0.0)
-                spread = ask - bid
-                mid = (bid + ask) / 2.0
-                
-                # Minimum bid-ask spread <= Rs 0.50 or 2% of mid-price
-                max_allowed_spread = max(0.50, mid * 0.02)
-                
-                if volume >= 100 and oi >= 1000 and spread <= max_allowed_spread:
+                # Before the regime is known, apply only quote integrity and the
+                # widest emergency spread cap. The final validator applies the
+                # stricter DIRECTIONAL or SIDEWAYS limit to the selected basket.
+                if leg_spread_is_within_emergency_limit(
+                    opt_data,
+                    maximum_pct=config.sideways_max_spread_pct,
+                ):
                     filtered.append(strike)
 
         return filtered

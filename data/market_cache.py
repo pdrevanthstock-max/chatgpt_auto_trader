@@ -12,7 +12,10 @@ class MarketCache:
     In-memory thread-safe cache of live market data.
     Single source of truth for all strategy and ranking modules.
     """
-    def __init__(self) -> None:
+    def __init__(self, strike_step: int = 50) -> None:
+        if strike_step <= 0:
+            raise ValueError("strike_step must be positive.")
+        self.strike_step = int(strike_step)
         self._lock = threading.RLock()
         self._spot_price: float = 0.0
         self._spot_timestamp: Optional[datetime] = None
@@ -45,8 +48,7 @@ class MarketCache:
         with self._lock:
             self._spot_price = price
             self._spot_timestamp = ts
-            # Derive ATM (nearest 50 points)
-            self._atm_strike = int(round(price / 50.0) * 50)
+            self._atm_strike = int(round(price / self.strike_step) * self.strike_step)
             self._last_update = datetime.now()
 
     def get_spot(self) -> tuple[float, Optional[datetime]]:
@@ -183,5 +185,46 @@ class MarketCache:
             self._last_update = None
             self._api_latency_ms = 0
 
-# Singleton global instance
-market_cache = MarketCache()
+class MarketCacheRegistry:
+    """Owns one isolated market-data cache per supported index."""
+
+    def __init__(self, caches: Dict[str, MarketCache]) -> None:
+        normalized = {str(symbol).upper(): cache for symbol, cache in caches.items()}
+        if not normalized:
+            raise ValueError("Market cache registry cannot be empty.")
+        self._caches = normalized
+
+    @classmethod
+    def default(cls, nifty_cache: MarketCache | None = None) -> "MarketCacheRegistry":
+        from core.index_registry import IndexRegistry
+
+        specs = IndexRegistry.default()
+        caches = {
+            symbol: (
+                nifty_cache
+                if symbol == "NIFTY" and nifty_cache is not None
+                else MarketCache(specs.get(symbol).strike_step)
+            )
+            for symbol in specs.symbols
+        }
+        return cls(caches)
+
+    @property
+    def symbols(self) -> set[str]:
+        return set(self._caches)
+
+    def get(self, symbol: str) -> MarketCache:
+        normalized = str(symbol).upper()
+        try:
+            return self._caches[normalized]
+        except KeyError as exc:
+            raise ValueError(f"Unsupported market cache: {normalized}") from exc
+
+    def clear(self) -> None:
+        for cache in self._caches.values():
+            cache.clear()
+
+
+# Backward-compatible NIFTY alias plus authoritative multi-index registry.
+market_cache = MarketCache(50)
+market_caches = MarketCacheRegistry.default(nifty_cache=market_cache)

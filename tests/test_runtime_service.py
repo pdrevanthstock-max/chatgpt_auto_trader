@@ -1,4 +1,5 @@
 import pytest
+from datetime import datetime
 
 from application.diagnostic_capture import DiagnosticCaptureService
 from application.runtime_service import RuntimeService
@@ -60,3 +61,16 @@ def test_production_paper_factory_locks_legacy_engine_to_paper():
     source = __import__("pathlib").Path("application/runtime_service.py").read_text(encoding="utf-8")
     assert 'execution_mode_lock="PAPER"' in source
     assert "BrokerExecutor" not in source
+
+
+def test_runtime_snapshot_exposes_server_authoritative_market_phase():
+    runtime = RuntimeService(
+        lambda: FakeEngine(),
+        now_provider=lambda: datetime(2026, 7, 16, 9, 20),
+    )
+
+    snapshot = runtime.snapshot()
+
+    assert snapshot.market_phase == "OBSERVATION_WARMUP"
+    assert snapshot.seconds_to_next_phase == 600
+    assert "entries begin at 09:30" in snapshot.market_status

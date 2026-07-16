@@ -89,4 +89,5 @@ def test_live_feed_source_builds_completed_option_and_spot_candles():
     source = Path("data/live_feed.py").read_text(encoding="utf-8")
     assert "completed_candles.add_tick" in source
     assert "option_candle_key" in source
-    assert 'spot_candle_key("NIFTY")' in source
+    assert "spot_candle_key(symbol)" in source
+    assert 'segments.get("IDX_I"' in source

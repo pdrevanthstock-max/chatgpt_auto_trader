@@ -83,12 +83,14 @@ class TradePlan:
     post_daily_sl: bool = False
     risk_capital_at_entry: float = 0.0
     hard_stop_loss: float = 0.0
+    index_symbol: str = "NIFTY"
 
 @dataclass
 class Trade:
     """Tracks the lifecycle of an active or closed trade."""
     id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
     execution_mode: str = "UNKNOWN"
+    index_symbol: str = "NIFTY"
     direction: TradeDirection = TradeDirection.LONG_CE
     strike_ce: int = 0
     strike_pe: int = 0
@@ -264,3 +266,4 @@ class ExecutionSignal:
     trade_id: Optional[str] = None
     trade_plan: Optional[TradePlan] = None
     reason: Optional[str] = None
+    reservation_token: Optional[str] = None

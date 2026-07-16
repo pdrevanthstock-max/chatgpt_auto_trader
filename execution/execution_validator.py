@@ -3,7 +3,8 @@ from datetime import datetime
 from typing import Optional
 from core.models import TradePlan, Trade
 from config.settings import TradingConfig
-from data.market_cache import market_cache
+from data.market_cache import MarketCache, market_cache
+from core.execution_quality import combined_spread_limit, has_valid_book
 
 logger = logging.getLogger("AutoTrader")
 
@@ -12,6 +13,9 @@ class ExecutionValidator:
     Final pre-order gate. Approves or blocks order entry based on system constraints,
     circuit breakers, active positions, and live liquidity.
     """
+    def __init__(self, cache: MarketCache | None = None) -> None:
+        self.cache = cache or market_cache
+
     def validate_entry(
         self,
         plan: TradePlan,
@@ -33,7 +37,7 @@ class ExecutionValidator:
             return True, "Validation successful (Backtest mode bypass)"
 
         # 3. Cache freshness & Broker connectivity
-        last_update, latency_ms = market_cache.get_health()
+        last_update, latency_ms = self.cache.get_health()
         if not last_update:
             return False, "MarketCache is empty or has not received updates."
 
@@ -45,7 +49,7 @@ class ExecutionValidator:
             return False, f"API latency too high: {latency_ms}ms > limit {config.health_check_api_latency_ms}ms."
 
         # 4. Spread check (liquidity gate)
-        chain = market_cache.get_option_chain()
+        chain = self.cache.get_option_chain()
         ce_data = chain.get(plan.scored_candidate.ce_strike, {}).get("CE")
         pe_data = chain.get(plan.scored_candidate.pe_strike, {}).get("PE")
 
@@ -64,34 +68,26 @@ class ExecutionValidator:
                     f"limit {config.health_check_cache_stale_sec}s."
                 )
 
-        spot, _ = market_cache.get_spot()
+        spot, _ = self.cache.get_spot()
         if spot > 0.0:
             ce_is_otm = plan.scored_candidate.ce_strike > spot
             pe_is_otm = plan.scored_candidate.pe_strike < spot
             if ce_is_otm and pe_is_otm:
                 return False, "Entry rejected: both OTM contracts expose the pair to dual premium decay."
 
-        active_expiry = market_cache.get_active_expiry()
+        active_expiry = self.cache.get_active_expiry()
         if active_expiry is not None:
             days_to_expiry = (active_expiry - now.date()).days
             if days_to_expiry < 0:
                 return False, "Entry rejected: selected option expiry has already passed."
-            if days_to_expiry <= config.expiry_guard_days:
-                if plan.regime.value == "SIDEWAYS":
-                    return False, "Entry rejected by expiry guard: SIDEWAYS paired buying is disabled near expiry."
-                if spot > 0.0 and (
-                    abs(plan.scored_candidate.ce_strike - spot) > config.expiry_near_atm_points
-                    or abs(plan.scored_candidate.pe_strike - spot) > config.expiry_near_atm_points
-                ):
-                    return False, "Entry rejected by expiry guard: directional contracts must be ATM or near-ATM."
 
         ce_bid = ce_data.get("bid", 0.0)
         ce_ask = ce_data.get("ask", 0.0)
         pe_bid = pe_data.get("bid", 0.0)
         pe_ask = pe_data.get("ask", 0.0)
 
-        if ce_bid <= 0.0 or ce_ask <= 0.0 or pe_bid <= 0.0 or pe_ask <= 0.0:
-            return False, "Missing bid/ask quotes for spread check."
+        if not has_valid_book(ce_data) or not has_valid_book(pe_data):
+            return False, "Missing, invalid, or inverted bid/ask quotes."
 
         if plan.quantity <= 0 or plan.lot_size <= 0:
             return False, "Entry quantity and lot size must both be positive."
@@ -111,11 +107,21 @@ class ExecutionValidator:
         pe_spread = pe_ask - pe_bid
         combined_spread = ce_spread + pe_spread
 
-        # Combined spread < Rs 1.50 or 2% of combined mid price
+        # Marketable directional entries use a strict spread. Sideways limit
+        # entries may wait for price improvement but retain an emergency cap.
         combined_mid = ((ce_bid + ce_ask) / 2.0) + ((pe_bid + pe_ask) / 2.0)
-        max_allowed_spread = max(config.health_check_spread_max, combined_mid * 0.02)
+        max_allowed_spread = combined_spread_limit(
+            plan.regime,
+            combined_mid=combined_mid,
+            absolute_floor=config.health_check_spread_max,
+            directional_pct=config.directional_max_spread_pct,
+            sideways_pct=config.sideways_max_spread_pct,
+        )
 
         if combined_spread > max_allowed_spread:
-            return False, f"Combined spread ₹{combined_spread:.2f} > max allowed ₹{max_allowed_spread:.2f}."
+            return False, (
+                f"{plan.regime.value} combined spread ₹{combined_spread:.2f} > "
+                f"max allowed ₹{max_allowed_spread:.2f}."
+            )
 
         return True, "Validation successful"

@@ -12,6 +12,9 @@ import { PairDiagnostics } from "./components/PairDiagnostics";
 import { PerformanceCards } from "./components/PerformanceCards";
 import { TradeJournal } from "./components/TradeJournal";
 import { EngineControls } from "./components/EngineControls";
+import { BacktestWorkspace } from "./components/BacktestWorkspace";
+import { LiveReadinessWorkspace } from "./components/LiveReadinessWorkspace";
+import { WorkspaceNavigation, type WorkspaceView } from "./components/WorkspaceNavigation";
 
 export default function App() {
   const [universe, setUniverse] = useState<IndexUniverseResponse | null>(null);
@@ -27,6 +30,7 @@ export default function App() {
   const [runtime, setRuntime] = useState<RuntimeSnapshot | null>(null);
   const [connected, setConnected] = useState(false);
   const [engineBusy, setEngineBusy] = useState(false);
+  const [workspace, setWorkspace] = useState<WorkspaceView>("paper");
 
   useEffect(() => {
     Promise.all([api.indices(), api.performance("today"), api.activePosition(), api.trades(), api.capital(), api.diagnostics(), api.runtime()])
@@ -136,7 +140,11 @@ export default function App() {
 
   return <main>
     <header className="app-header"><div><p className="eyebrow">PAPER validation workspace</p><h1>AutoTrader Control Center</h1></div><span className="paper-lock">PAPER · Broker writes disabled</span></header>
+    <WorkspaceNavigation current={workspace} onChange={setWorkspace} />
     {error && <div className="error" role="alert">{error}</div>}
+    {workspace === "backtest" && <BacktestWorkspace />}
+    {workspace === "live" && <LiveReadinessWorkspace />}
+    {workspace === "paper" && <>
     {runtime && <EngineControls runtime={runtime} busy={engineBusy} onStart={startEngine} onStop={stopEngine} />}
     {!universe ? <section className="panel">Loading server-backed dashboard…</section> :
       <IndexSelector indices={universe.indices} selection={universe.selection} disabled={saving} onChange={updateSelection} />}
@@ -148,5 +156,6 @@ export default function App() {
     <ActivityConsole events={events} connected={connected} />
     <TradeJournal trades={trades} />
     {capital && <CapitalPanel capital={capital} engineRunning={runtime?.state === "RUNNING"} onAdjust={adjustCapital} />}
+    </>}
   </main>;
 }

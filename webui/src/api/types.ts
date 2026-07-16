@@ -35,7 +35,7 @@ export interface PerformanceSnapshot {
 }
 
 export interface TradeRow {
-  trade_id: string; execution_mode: string; direction: string; regime: string; phase: string;
+  trade_id: string; execution_mode: string; index_symbol: string; direction: string; regime: string; phase: string;
   ce_strike: number; pe_strike: number; ce_entry: number; pe_entry: number;
   ce_exit: number | null; pe_exit: number | null; lots: number; lot_size: number;
   units_per_leg: number; entry_time: string | null; exit_time: string | null;
@@ -70,6 +70,9 @@ export interface RuntimeSnapshot {
   execution_mode: "PAPER";
   has_active_position: boolean;
   activity: string[];
+  market_phase: string;
+  market_status: string;
+  seconds_to_next_phase: number;
 }
 
 export interface RuntimeEvent {

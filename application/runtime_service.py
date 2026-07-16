@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from threading import RLock
 from typing import Callable, Protocol
 
 from application.diagnostic_capture import DiagnosticCaptureService
 from application.index_selection import IndexSelectionService
+from application.market_session import MarketSessionSchedule
 
 
 class EnginePort(Protocol):
@@ -24,15 +26,24 @@ class RuntimeSnapshot:
     execution_mode: str
     has_active_position: bool
     activity: tuple[str, ...]
+    market_phase: str
+    market_status: str
+    seconds_to_next_phase: int
 
 
 class RuntimeService:
     """Owns one process-level engine and enforces the web app's PAPER-only lock."""
 
-    def __init__(self, engine_factory: Callable[[], EnginePort]) -> None:
+    def __init__(
+        self,
+        engine_factory: Callable[[], EnginePort],
+        now_provider: Callable[[], datetime] | None = None,
+    ) -> None:
         self._factory = engine_factory
         self._engine: EnginePort | None = None
         self._lock = RLock()
+        self._now_provider = now_provider or datetime.now
+        self._market_schedule = MarketSessionSchedule()
 
     @property
     def engine(self) -> EnginePort | None:
@@ -48,11 +59,15 @@ class RuntimeService:
                 and engine.active_trade is not None
                 and getattr(engine.active_trade, "is_open", False)
             )
+            market = self._market_schedule.at(self._now_provider())
             return RuntimeSnapshot(
                 state="RUNNING" if running else "STOPPED",
                 execution_mode="PAPER",
                 has_active_position=active,
                 activity=tuple(list(engine.activity_log)[-200:]) if engine else (),
+                market_phase=market.phase.value,
+                market_status=market.message,
+                seconds_to_next_phase=market.seconds_to_next_phase,
             )
 
     def start(self) -> RuntimeSnapshot:

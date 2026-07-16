@@ -692,3 +692,383 @@ Completion requires fresh test output plus code/UI review; passing unit tests al
 - Re-ran the complete backend suite with a new isolated temp directory and disabled pytest cache: `python -m pytest -q -p no:cacheprovider --basetemp .pytest-run-git-20260715`.
 - Fresh result: `147 passed, 1 warning in 8.25s`. The warning remains the known Starlette TestClient/httpx deprecation notice.
 - Added `.pytest-run-*/` to `.gitignore`; no locked temp directory was deleted and no trading code or configuration dates were changed.
+
+### 2026-07-15 — Feature branch committed and pushed
+
+- User completed frontend verification: Vitest `8 passed`; TypeScript/Vite production build succeeded.
+- `git diff --cached --check` passed before commit.
+- Commit created successfully: `170a341 Complete paper-safe web UI and price integrity controls` with 86 files changed.
+- Branch pushed successfully to `origin/codex/capital-live-safety-readiness-docs` and configured to track the remote branch.
+- Post-push branch status confirmed local and remote aligned at `170a341`.
+- Only `docs/superpowers/` remains untracked and intentionally excluded from the commit.
+- Next repository action is to open/review the GitHub pull request against `main`; merging remains a user-controlled action.
+
+### 2026-07-16 — Automatic-start service repaired and Claude audit validated
+
+**Observed startup failure and root causes**
+
+- User reported `ERR_CONNECTION_REFUSED` at `http://127.0.0.1:8000` after starting the PC.
+- Windows initially reported that scheduled task `AutoTrader Web UI` did not exist; no process listened on port 8000 and no launcher logs existed. The scripts had been committed, but the machine-level/current-user task registration was absent.
+- After installing the task, the hidden Windows PowerShell 5.1 launcher hung before Python because `Invoke-RestMethod` did not respect the expected two-second timeout while localhost refused the connection.
+- After replacing that probe, Uvicorn started but Windows PowerShell converted its normal stderr `INFO` startup message into a terminating `NativeCommandError` under `$ErrorActionPreference = "Stop"`, immediately ending the server with task result `0x1`.
+
+**Implemented startup corrections**
+
+- Replaced the blocking HTTP preflight with a bounded `System.Net.Sockets.TcpClient.ConnectAsync(...).Wait(1000)` port check.
+- Added explicit launcher-stage logging.
+- Replaced direct native invocation/redirection with `Start-Process`, dedicated stdout/stderr files, `PassThru`, and exit-code tracking. This prevents normal Uvicorn stderr from being treated as a PowerShell exception.
+- Extended `tests/test_windows_startup_task.py` test-first to protect the bounded probe, PAPER-only server command, clean native process boundary, hidden/reversible task, and absence of trading-engine start calls.
+- Installed and manually started current-user scheduled task `AutoTrader Web UI`.
+
+**Verified machine state**
+
+- Task state: `Running`.
+- Trigger: current user `DESKTOP-R1M1JB6\LENOVO` at logon, delay `PT30S`.
+- Action: hidden Windows PowerShell executing `scripts/start_web_app_hidden.ps1`.
+- API: `GET http://127.0.0.1:8000/api/health` returned `{"status":"ok","execution_safety":"PAPER_ONLY_DURING_BUILD"}`.
+- Browser root: `GET http://127.0.0.1:8000/` returned HTTP 200.
+- Uvicorn service process remained running and logs showed successful application startup.
+- The task starts only FastAPI/React. It does not start the trading engine, enable LIVE, or submit broker orders.
+
+**Claude audit validation**
+
+- Confirmed Claude's listed critical strategy fixes remain present and covered by `tests/test_critical_findings_regression.py`.
+- Claude's proposed concurrent reservation test was already implemented with a real `ThreadPoolExecutor` and 20 simultaneous contenders; no duplicate test was added.
+- Claude's statement that five production index scanners are protected by the coordinator is premature. The atomic coordinator boundary is tested, but the production market-data/execution adapter remains NIFTY-only. Other indices remain visibly feed-pending and non-executable.
+- Claude's statements that WebSocket streaming, diagnostic controls, period P&L, and React PAPER parity were still pending were outdated relative to the current branch; those UI capabilities are implemented and tested.
+- Automatic broker-order retry was not added. Retrying a non-idempotent order write can duplicate real orders. Bounded retry remains restricted to idempotent market-data reads.
+- Existing broker safety coverage already includes allocation rejection before placement, confirmed fill prices/quantities, second-leg rejection unwind, pending cancellation, partial-entry unwind, partial exits, remaining-unit tracking, and single-leg partial exit behavior.
+- Streamlit decommission remains a user decision; no arbitrary removal date was introduced. README now marks FastAPI/React as the authoritative PAPER UI and Streamlit as legacy compatibility that should not run in parallel during normal testing.
+
+**Additional restart defect found and fixed**
+
+- A mode-scoped LIVE recovery file restored its `Trade` with `execution_mode="UNKNOWN"` because `CrashRecovery._deserialize_trade()` did not propagate the requested/stored mode.
+- Added a failing regression for LIVE partial-exit restart state, then propagated and validated execution mode during deserialization. The test also protects `ce_open_units`, `pe_open_units`, `PARTIAL_EXIT`, and the hard per-trade stop.
+- Stored/requested recovery mode mismatches now fail closed instead of silently loading cross-mode state.
+
+**Fresh verification**
+
+- Critical startup/LIVE/audit subset: `30 passed`.
+- Complete backend: `148 passed, 1 warning in 15.84s`.
+- Frontend: `8 passed`.
+- TypeScript/Vite production build: succeeded.
+- Availability remained healthy after the full verification run: API health OK and browser root HTTP 200.
+- `git diff --check` passed; only Windows LF-to-CRLF notices were emitted.
+- `config.json` remains PAPER with LIVE disabled; user-owned backtest dates remain unchanged.
+
+**Remaining boundary**
+
+- A true sign-out/sign-in or reboot is the final environmental confirmation of the logon trigger. The same registered task action was manually started and verified end-to-end in this session.
+- Production multi-index feeds beyond NIFTY remain intentionally unavailable pending index-specific market caches, instrument validation, candle feeds, sizing/freeze metadata, and coordinator wiring.
+
+### 2026-07-16 — Premarket scheduler, persistent activity logs, and web workspace boundaries
+
+**User questions and clarified operational truth**
+
+- The production adapter does not yet trade three indices. Only NIFTY has a connected production feed/entry adapter. BANKNIFTY and FINNIFTY remain approved but feed-pending; MIDCPNIFTY and NIFTYNXT50 remain observe-only and feed-pending.
+- Starting the Windows service starts only FastAPI/React. Starting the trading engine remains an explicit UI action. This prevents PC sign-in or a backend restart from silently initiating trading.
+- If the browser breaks but FastAPI remains healthy, the backend engine and its one-second monitoring loop continue. If the API process dies, monitoring stops until the supervised service restarts; the trading engine deliberately remains stopped afterward and must be explicitly restarted after recovery-state inspection.
+- The dashboard Stop control refuses to stop with an active position. Operating-system task termination cannot provide that application-level guarantee and must never be used while a position is open.
+
+**Premarket defect and implementation**
+
+- Root cause of repeated `Waiting for spot price cache update...` lines: the one-second risk cycle tested spot availability before market-session/entry gating and logged every miss without throttling.
+- Added modular `application/market_session.py` with IST phases: idle before 09:05, startup countdown 09:05–09:15, observation warm-up 09:15–09:30, entry window 09:30–15:10, entry closed 15:10–15:20, and market closed afterward/weekends.
+- Idle status is limited to a ten-minute heartbeat; countdown/warm-up messages to one minute. The UI receives the server-authoritative phase, message, and seconds to the next transition.
+- Entry scheduling applies only when no position is open. Recovered/open-position risk and exit monitoring is never suspended by a premarket phase.
+- Entry scans remain every 60 seconds using completed candles; risk/exits remain on the one-second loop.
+
+**Logs and service recovery**
+
+- Added modular rotating `application/activity_journal.py`; engine activity is persisted to `logs/engine-activity.log`.
+- Existing service logs remain `logs/web-app-launcher.log`, `logs/web-app-service.log`, and `logs/web-app-service-error.log`.
+- Hardened the hidden launcher into a supervisor: unexpected non-zero Uvicorn exits are logged and retried after five seconds. A clean exit stops the supervisor.
+- Documented task start/stop/state inspection, log tailing, and crash validation in README.
+
+**Backtesting and LIVE web boundaries**
+
+- Added PAPER operations, Backtesting, and LIVE readiness navigation.
+- Backtesting is non-executable today and honestly lists remaining server-side isolation, validation, progress/cancel, export, and legacy-regression work.
+- LIVE readiness is read-only and locked. There is no LIVE start API and the FastAPI runtime factory remains PAPER-locked.
+- The intended future gate is server-side hashed-PIN authentication with rate limiting, short-lived sessions, non-secret audit events, stopped-engine/no-position checks, broker-confirmed allocation, readiness thresholds, typed confirmation, and a second authorization check at execution time. No PIN or LIVE broker route was added in this slice.
+
+**Test-first evidence**
+
+- New market-session/activity/engine-placement tests were observed red, then passed (`6 passed`).
+- Runtime/API/session subset passed (`14 passed`, one known Starlette deprecation warning).
+- React operational/navigation tests passed (`7 passed`); TypeScript/Vite build succeeded.
+- User-owned `config.json` dates remain unchanged and LIVE remains disabled.
+
+**Machine activation and an additional Windows process finding**
+
+- Restarting the scheduled task initially exposed that `Stop-ScheduledTask` stopped the PowerShell wrapper but left its child Uvicorn process listening on port 8000. The next task invocation correctly refused to create a duplicate, but this also meant it continued serving the old code.
+- Verified the listener before termination: PID 14856, Python command line `-m uvicorn api.app:app --host 127.0.0.1 --port 8000`, rooted in this workspace's virtual environment. Only that verified stale listener was stopped.
+- Restarted `AutoTrader Web UI`; the new Uvicorn service is healthy and the task remains running.
+- Readback from the updated API: PAPER, engine STOPPED, no active position, phase `STARTUP_COUNTDOWN`, and a server-calculated countdown to the 09:15 observation phase. The service restart did not start the engine.
+- Full final verification after implementation: backend `155 passed, 1 warning`; frontend `9 passed`; Vite production build succeeded; API health returned `PAPER_ONLY_DURING_BUILD`.
+
+**Guarded manual service stop correction**
+
+- End-to-end restart testing proved that `Stop-ScheduledTask` alone can leave Uvicorn alive. README no longer presents it as a complete stop command.
+- The launcher now records its managed virtual-environment Python PID in `logs/web-app.pid`.
+- Added `scripts/stop_web_app.ps1`. It stops the task supervisor first, validates that the recorded process command contains this workspace's venv, `-m uvicorn`, `api.app:app`, and port 8000, recursively validates the spawned Python child, tolerates only Windows' expected `conhost.exe`, and fails closed for any other descendant or command mismatch.
+- `scripts/uninstall_startup_task.ps1` now invokes the guarded stop before unregistering the task.
+- Machine verification: the guarded script stopped PID 19228 and its verified Uvicorn child, port 8000 closed, the scheduled task restarted, a new managed PID file was created, API health returned OK, and runtime remained PAPER/STOPPED/no-position.
+- Re-ran the complete backend suite after this correction: `155 passed, 1 warning`; `git diff --check` passed with only line-ending notices.
+
+### 2026-07-16 — Dhan token refresh and service restart validation
+
+- User replaced an expired Dhan token, then correctly stopped the managed web service with `scripts/stop_web_app.ps1` from the repository root. Their attempted `scripts/start_web_app.ps1` command failed because no such script exists; the supported start mechanism is `Start-ScheduledTask -TaskName "AutoTrader Web UI"`, which works from any PowerShell directory.
+- Inspected `.env` without printing secrets: exactly one `DHAN_CLIENT_ID` and one `DHAN_ACCESS_TOKEN` entry exist, both non-empty, and `.env` was modified at 09:32 IST.
+- Confirmed port 8000 was closed after the guarded stop.
+- Started the scheduled task and waited for API health.
+- Validated the refreshed token using `DhanClient(orders_enabled=False).validate_credentials()`. This performs only the read-only Dhan positions query; broker order writes remained disabled. Result: VALID.
+- Final runtime readback: service task Running, PAPER mode, engine STOPPED, no active position, and `ENTRY_WINDOW` active. The user must refresh the browser and explicitly start the PAPER engine.
+
+### 2026-07-16 — Live scan and multi-index capability cross-check
+
+- User started the PAPER engine and reported no position plus one-second activity messages.
+- Verified runtime live: PAPER engine RUNNING, no active position, entry window active, all five symbols selected, diagnostics normally off.
+- Completed NIFTY spot candles advanced normally from 2 through 10. The one-second messages were the unthrottled feature-readiness branch while fewer than 10 completed candles existed; after readiness, scan activity occurred at the configured 60-second cadence. This warm-up message remains a logging-noise defect, not a feed failure.
+- At 09:51:04 the first eligible NIFTY scan used spot 24,128.10 / ATM 24,150 but was safely skipped because CPU health measured 100% above the 90% gate. Independent CPU samples remained elevated (approximately 57%, 82%, 89%).
+- At 09:52:05 the scan ran fully: one matched-ATM candidate passed liquidity and divergence, then failed the final entry/ranker stage. Diagnostic capture was not active for that scan, so its exact final reason was not retrospectively available.
+- Temporarily enabled Top-5 diagnostics for two subsequent scans, then turned capture off:
+  - 09:53:05, NIFTY 24,100 CE/PE, SIDEWAYS: CE velocity 0.2409%, PE 0.2773%, divergence 0.0365%; rejected below the 1–5% band.
+  - 09:54:06, NIFTY 24,100 CE/PE, SIDEWAYS: CE velocity 0.8582%, PE -0.7112%, divergence 1.5694%; signal passed but ranker rejected projected gross -₹38.53, costs ₹178.32, slippage ₹26, projected net -₹242.85 for 2 lots/130 units per leg.
+- At 09:55:07 another scan was safely skipped because CPU measured 98.3%.
+- The absence of a position was therefore correct: usable NIFTY data existed, but each opportunity was rejected by health, divergence, or negative projected-net safeguards.
+- Runtime capability truth was reconfirmed from `/api/indices`: only NIFTY has `runtime_connected=true`. BANKNIFTY and FINNIFTY are marked tradable targets but `runtime_connected=false`; MIDCPNIFTY and NIFTYNXT50 are observe-only and also disconnected. Selecting all five does not create three production feeds or apply the strategy to them.
+
+### 2026-07-16 — Cross-strike requirement reopened and three-index PAPER design started
+
+- User clarified that cross-strike opportunities are required and requested PAPER scanning/trading for NIFTY, BANKNIFTY and FINNIFTY, with MIDCPNIFTY and NIFTYNXT50 observation-only.
+- Current executable behavior was reconfirmed: `PairCandidateGenerator` calls `PairTemplateGenerator.matched_atm()`, which returns exactly one nearest matched-ATM CE/PE pair. It does not scan executable cross strikes.
+- This requirement supersedes the matched-ATM-only scope, but the old unrestricted ATM±10 CE×PE Cartesian matrix will not be restored without explicit approval because it previously admitted unsafe moneyness/premium combinations.
+- Production wiring assessment:
+  - `LiveFeed` filters only `NIFTY-`, uses a hard-coded 50-point strike step/range, writes only the singleton `market_cache`, and stores all candles under NIFTY keys.
+  - `LiveEngine` reads only NIFTY spot candles and selection, and diagnostics label every scan NIFTY.
+  - planner, ranker, sizer and rotation still derive lot sizing from `config.nifty_lot_size` rather than an index contract specification.
+  - the tested `MultiIndexCoordinator` exists but is not connected to production scanners/execution.
+  - `security_id_list.csv` contains option rows for all five requested indices, so instrument discovery is feasible, but expiry/strike-step/lot/freeze validation must be index-specific.
+- Safe target architecture under design: isolated per-index cache/feed/candle/scanner contexts; independent results for five selected indices; diagnostics for all five; only NIFTY/BANKNIFTY/FINNIFTY eligible for PAPER execution; one atomic global active-position slot; selected winner by positive projected net/confidence; no LIVE broker route changes.
+- Implementation is paused at the required strategy-design decision: exact bounded cross-strike universe (recommended ±1 strike step with safety gates versus wider bounded ranges versus the unsafe old full matrix).
+
+### 2026-07-16 — Bounded ATM/ITM ±4 universe selected; expiry execution still to resolve
+
+- User selected ATM ±4 strike steps but clarified that only ATM and ITM contracts should be executable for the three tradable PAPER indices because OTM premium decay is currently too dangerous for the unstable system, especially during sideways expiry/near-expiry sessions.
+- Exact interpreted template per index:
+  - CE set: ATM, ITM1, ITM2, ITM3, ITM4 (strikes at ATM and below spot by that index's validated strike step).
+  - PE set: ATM, ITM1, ITM2, ITM3, ITM4 (strikes at ATM and above spot by that index's validated strike step).
+  - Cross those two five-contract sets for at most 25 candidate pairs per index; do not create an 81-pair ATM±4 grid and do not include OTM contracts.
+- Apply the existing safety gates to every candidate: reject both legs decaying, premium ratio above 2.5, non-positive/insufficient projected net after Dhan costs and slippage, stale/incomplete/asynchronous candles, invalid spreads/liquidity, and any failed price-integrity check.
+- Intended indices remain NIFTY, BANKNIFTY and FINNIFTY for PAPER eligibility; MIDCPNIFTY and NIFTYNXT50 remain observation/diagnostics only; one global active position remains mandatory.
+- One material ambiguity remains before design approval: whether expiry day/near-expiry day should block all PAPER entries, allow only ATM/ITM execution, or observe without execution on expiry day.
+
+### 2026-07-16 — Expiry PAPER analysis approved; moneyness direction corrected
+
+- User confirmed expiry-day PAPER trades should remain enabled because the results are useful for system analysis. They proposed ATM entries when momentum exists and ITM entries otherwise; the exact regime-to-template mapping still needs one final definition.
+- Corrected the example and locked the moneyness convention:
+  - One deterministic ATM strike is selected per index snapshot; CE and PE do not receive separate ATM strikes.
+  - For spot around 24,128 with ATM 24,150 and 50-point steps, CE ATM/ITM set is 24,150, 24,100, 24,050, 24,000, 23,950.
+  - PE ATM/ITM set is 24,150, 24,200, 24,250, 24,300, 24,350.
+  - PE 23,950 is OTM and therefore forbidden; CE 24,300 is OTM and therefore forbidden.
+  - Valid cross examples include 24,100 CE + 24,200 PE or 23,950 CE + 24,300 PE; both legs are ATM/ITM under the selected convention.
+- The same direction rule must use each index's validated strike step; no hard-coded NIFTY step may leak into BANKNIFTY/FINNIFTY.
+
+### 2026-07-16 — Integrity gates proposed for all days with concrete meanings
+
+- User clarified that the regime-dependent template should be expiry-specific, while asking whether dual-decay, premium-ratio, projected-net, liquidity and freshness gates should also apply on normal days.
+- Recommendation: keep all five integrity/economic gates active on every day. They prevent structurally poor or unexecutable entries and are not expiry-only controls.
+- Proposed day/template split pending user confirmation:
+  - Normal days: evaluate all 25 bounded ATM/ITM cross-pairs under existing regime divergence bands (SIDEWAYS 1–5%, confirmed DIRECTIONAL 1–10%).
+  - Expiry day: confirmed directional momentum may evaluate all 25; SIDEWAYS/no momentum excludes ATM-containing pairs and evaluates only 16 ITM×ITM pairs.
+- Exact examples prepared for approval:
+  - Dual decay: synchronized completed candle CE ₹120→₹117 (-2.5%) and PE ₹100→₹99 (-1%); reject because neither bought leg is appreciating. Current condition treats both velocities `<= 0` as dual decay.
+  - Premium ratio: CE ask ₹150 and PE ask ₹50 gives 3.0, above configured 2.5; reject. CE ₹120 and PE ₹60 gives 2.0 and may proceed to other gates.
+  - Projected net: actual 09:54 PAPER diagnostic projected gross -₹38.53, Dhan costs ₹178.32, slippage ₹26, net -₹242.85; reject. Code also requires at least ₹100 projected net and 0.25% projected return, not merely net above zero.
+  - Bad liquidity: PAPER requires each strike volume >=100, OI >=1000, and spread <= max(₹0.50, 2% of mid). Bid ₹99/ask ₹102 has ₹3 spread versus about ₹2.01 maximum and fails; volume 80 or OI 700 also fails independently.
+  - Stale/asynchronous prices: cache older than 10 seconds fails health; CE and PE completed candles with different latest timestamps are skipped; missing/non-positive bid/ask or ask below bid fails price integrity.
+
+### 2026-07-16 — Liquidity objection reviewed; adaptive execution-quality design recommended
+
+- User agreed that dual-decay, premium-ratio, projected-net and stale/invalid-price safeguards should apply on normal days as well, but challenged the universal hard liquidity gate. Their reasoning: index options are generally liquid, and SIDEWAYS entries use limit orders, so repeated volume/OI and bid/ask screening may waste time.
+- Critical assessment rather than automatic agreement:
+  - Broad index-option liquidity does not guarantee that every selected strike, expiry and session is liquid. ITM4 contracts, FINNIFTY contracts, and contracts near the open/close can have materially different depth and spreads from NIFTY ATM.
+  - A limit order does not remove spread or liquidity risk; it exchanges price certainty for fill uncertainty. An unfilled hedge leg can invalidate the intended two-leg position.
+  - PAPER results become overstated if a limit is assumed filled without market evidence. The current `PaperExecutor` is safer than an instant mid-price simulator because it requires both current asks to be at or below their buy limits and otherwise creates no trade. It still evaluates only the current quote snapshot; it does not yet model a resting order, later quote crossing, timeout/cancel, or partial-fill recovery over time.
+- Recommended adaptive policy, pending approval:
+  - Remove fixed `volume >= 100` and `OI >= 1000` as universal hard blockers. Use volume, OI and available depth as ranking/confidence signals and diagnostics because their scales differ by index, strike and time of day.
+  - Keep quote integrity universal: positive bid/ask, ask >= bid, price age <=10 seconds, synchronized completed candles, and usable depth when supplied.
+  - DIRECTIONAL/marketable entries retain a strict spread cap and must value buys at executable ask and exits at executable bid.
+  - SIDEWAYS limit entries may tolerate a wider normal spread, but must never be marked filled merely because an order was submitted. A future implementation should require later quote/trade evidence that each limit was executable, apply a short timeout/cancel policy, and preserve atomic two-leg behavior or safely unwind a simulated partial basket.
+  - Retain an emergency maximum-spread/invalid-market rejection for every regime. Extreme quotes such as bid ₹80 / ask ₹120 are not trustworthy enough for entry even with a limit order.
+- Concrete behavior examples:
+  - DIRECTIONAL: bid ₹99 / ask ₹102 can fail the strict spread rule and should not be crossed as a marketable PAPER buy.
+  - SIDEWAYS: at bid ₹99 / ask ₹102, a ₹100.50 buy limit remains pending; it fills only after executable evidence such as ask <= ₹100.50. If that never occurs before timeout, no trade is recorded.
+  - SIDEWAYS extreme market: bid ₹80 / ask ₹120 is rejected by the emergency execution-quality cap rather than left indefinitely pending.
+- No trading code was changed during this discussion. The next required decision is whether to approve this adaptive execution-quality policy in place of the current fixed volume/OI/spread hard gate.
+
+### 2026-07-16 — Adaptive execution-quality policy implemented and verified
+
+- User approved the adaptive policy. Implementation remained PAPER-safe and did not change `BrokerExecutor`, enable LIVE, start the trading engine, or submit any broker order.
+- Added the focused pure policy module `core/execution_quality.py`:
+  - validates finite, positive and non-inverted bid/ask books;
+  - provides the widest pre-regime emergency per-leg spread check;
+  - calculates regime-specific combined spread limits.
+- Changed live/PAPER pre-candidate filtering:
+  - removed fixed `volume >= 100` and `OI >= 1000` as hard entry blockers;
+  - volume and OI remain confidence/ranking bonuses and diagnostics;
+  - invalid quotes and emergency-wide per-leg spreads are still rejected;
+  - BACKTEST's existing historical volume-only behavior remains unchanged.
+- Changed candidate confidence behavior:
+  - a candidate that already passes executable-price, premium-ratio, safe-size and projected-net gates now starts at the minimum passing confidence of 70;
+  - volume, OI and tight spreads can improve its score but their absence alone cannot silently reject it.
+- Changed final spread validation:
+  - DIRECTIONAL/marketable basket maximum remains 2% of combined mid-price, subject to the existing ₹1.50 combined absolute floor;
+  - SIDEWAYS/limit basket maximum is 5% of combined mid-price, also subject to the ₹1.50 floor;
+  - rejection messages identify the applicable regime.
+- Added conservative resting PAPER limit behavior in `execution/paper_limit_fill.py`:
+  - SIDEWAYS limits are monitored for up to 15 seconds at one-second intervals;
+  - both CE and PE asks must satisfy their limits in the same option-chain snapshot;
+  - timeout raises a controlled `PartialFillError` and creates no Trade, so no partial PAPER basket is recorded;
+  - missing or invalid asks fail closed.
+- Self-review found and corrected a second issue before completion: `TradePlanner` previously set SIDEWAYS limits equal to the current ask, which normally filled immediately and contradicted the approved midpoint example. SIDEWAYS limits now use the top-of-book midpoint for each leg, require valid positive/non-inverted bids and asks, and fail closed otherwise. DIRECTIONAL orders remain MARKET orders with no limit prices.
+- Runtime settings added without changing the user's dates:
+  - `directional_max_spread_pct = 0.02`;
+  - `sideways_max_spread_pct = 0.05`;
+  - `paper_limit_fill_timeout_seconds = 15.0`;
+  - `paper_limit_fill_poll_seconds = 1.0`;
+  - preserved `backtest_from_date = 2026-06-09` and `backtest_to_date = 2026-07-13`.
+- TDD evidence:
+  - initial adaptive test run: eight expected failures exposing the old hard blockers, hidden confidence rejection, universal 2% spread rule and missing waiting-limit interface;
+  - planner test run: two expected failures exposing missing midpoint limit pricing;
+  - focused final suite: 18 passed;
+  - complete backend suite: 165 passed, one existing Starlette/httpx deprecation warning;
+  - frontend: 9 passed; Vite production build succeeded;
+  - `git diff --check` passed with Windows line-ending notices only.
+- Windows UI service was initially unreachable. The existing `AutoTrader Web UI` scheduled task was started after verification. Read-only health returned `status=ok` and `PAPER_ONLY_DURING_BUILD`; runtime readback returned PAPER, engine STOPPED and no active position. Starting the UI service did not start the engine.
+- Existing unrelated working-tree changes, `docs/superpowers/`, logs and prior service/UI work were not staged, committed or modified as part of this execution-quality change.
+
+### 2026-07-16 — Multi-index feeds and bounded ATM/ITM cross-strike runtime completed
+
+- User approved implementation of the multi-index PAPER runtime and the bounded ATM/ITM cross-strike scanner. This supersedes the earlier handover statements that only NIFTY was runtime-connected or that the cross-strike design was still pending.
+- PAPER safety remained non-negotiable throughout implementation:
+  - no engine was started;
+  - no broker write method was called;
+  - no LIVE multi-index entry route was added;
+  - the production multi-index coordinator explicitly rejects entry dispatch unless the session execution mode is PAPER;
+  - existing `BrokerExecutor` behavior and LIVE enablement settings were not expanded.
+- Added authoritative index metadata in `core/index_registry.py` for all five runtime-connected indices:
+  - NIFTY: underlying security ID 13, lot 65, strike step 50, PAPER tradable;
+  - BANKNIFTY: ID 25, lot 30, step 100, PAPER tradable;
+  - FINNIFTY: ID 27, lot 60, step 100, PAPER tradable;
+  - MIDCPNIFTY: ID 442, lot 120, step 25, observe-only;
+  - NIFTYNXT50: ID 38, lot 25, step 100, observe-only.
+- Added one isolated `MarketCache` per index through `MarketCacheRegistry`. The old singleton `market_cache` remains only as a backward-compatible NIFTY alias; clearing or updating one new index context cannot contaminate another.
+- Rebuilt `LiveFeed` as a bounded five-index quote poller:
+  - reads the local Dhan instrument master once and validates each index's nearest active expiry, lot size and minimum strike step;
+  - fetches all five direct index spots through `IDX_I`; no synthetic CE/PE parity spot is used;
+  - after spot discovery, fetches five ATM/ITM CE contracts plus five ATM/ITM PE contracts per index in one `NSE_FNO` quote batch;
+  - includes tracked active-position strikes if needed;
+  - writes spot/option candles and quotes into symbol-specific cache/candle keys;
+  - retains typed bounded retry handling for empty, non-JSON or invalid quote responses.
+- Read-only mapping smoke check against the actual 28.8 MB `security_id_list.csv` succeeded:
+  - NIFTY expiry 2026-07-21, 436 mapped contracts;
+  - BANKNIFTY expiry 2026-07-28, 758 contracts;
+  - FINNIFTY expiry 2026-07-28, 308 contracts;
+  - MIDCPNIFTY expiry 2026-07-28, 524 contracts;
+  - NIFTYNXT50 expiry 2026-07-28, 720 contracts.
+- Read-only request smoke check with representative spots produced exactly five index quotes plus 50 bounded option quotes (55 total) and zero broker write calls. This is comfortably below Dhan Market Quote's documented 1,000-instrument request maximum.
+- Implemented the exact approved pair universe in `PairTemplateGenerator.atm_itm_cross` and `PairCandidateGenerator`:
+  - deterministic ATM is rounded using each index's validated strike step;
+  - CE contracts are ATM and ITM1–ITM4 below ATM;
+  - PE contracts are ATM and ITM1–ITM4 above ATM;
+  - normal sessions and confirmed directional expiry sessions evaluate at most 25 CE×PE ATM/ITM pairs;
+  - SIDEWAYS expiry-day sessions exclude every ATM-containing layout and evaluate only 16 ITM×ITM pairs;
+  - OTM contracts are absent by construction rather than filtered after ranking.
+- Corrected completed-candle divergence to the approved definition: each leg's velocity now uses the latest completed candle's own open versus close. The previous completed candle is used only to require a synchronized completed pair; close-to-close gaps no longer inflate divergence.
+- Added `IndexScanner`, which owns one fully isolated generator, execution-quality filter, divergence scanner, entry evaluator, ranker, position sizer, planner and final validator per index. Lot size, strike step, cache freshness, option quotes and transaction-cost projections are index-specific.
+- Added `MultiIndexRuntime`, which:
+  - reads the atomic UI selection on every scan;
+  - treats zero selected indices as Pause New Entries;
+  - requires ten completed one-minute spot candles independently for each selected index;
+  - computes an independent regime/trend per ready index;
+  - records diagnostics for tradable and observe-only indices;
+  - delegates final selection to `MultiIndexCoordinator`.
+- Connected `MultiIndexCoordinator` and `PositionReservation` to the production PAPER engine:
+  - every selected index can be scanned;
+  - MIDCPNIFTY/NIFTYNXT50 opportunities are recorded but never eligible for execution;
+  - NIFTY/BANKNIFTY/FINNIFTY candidates compete by projected net profit, then confidence and deterministic symbol tie-break;
+  - one global reservation is acquired before queueing and stays active through the position lifecycle;
+  - failed/rejected PAPER entry execution releases the reservation;
+  - crash-recovered positions reacquire the global slot;
+  - normal/manual exit releases it.
+- Replaced NIFTY-only active-position routing in the current engine path:
+  - one-second risk/exit monitoring reads the cache belonging to `Trade.index_symbol`;
+  - PAPER entry, exit, hedge-cut and rotation use the matching index's cache-backed executor and contract lot size;
+  - rotation remains within the active position's own index and uses the same bounded template;
+  - missing active quotes fail closed and keep new entries blocked.
+- Persisted `index_symbol` end to end:
+  - `TradePlan`, `Trade` and PAPER execution;
+  - SQLite with backward-compatible migration defaulting legacy rows to NIFTY;
+  - crash-recovery JSON with legacy default NIFTY;
+  - dashboard active-position and journal API rows;
+  - web UI active-position card and journal now display the index explicitly.
+- PAPER daily-threshold tagging is propagated through the new coordinator: after today's PAPER threshold is active, a newly queued plan retains `post_daily_sl=true` and displays the `-SL` trade identifier; the daily threshold still does not block further PAPER test opportunities.
+- Existing all-day integrity gates remain active for every index: dual-decay rejection, maximum premium ratio 2.5, minimum projected net/return after Dhan costs and slippage, invalid/stale/asynchronous price rejection, adaptive execution-quality spread rules, capital/sizing validation, and atomic PAPER limit-fill timeout.
+- Final economic-integrity review found and corrected a capital-basis mismatch: the ranker was projecting P&L with `config.total_capital` while the final plan could be sized from much lower remaining PAPER equity. Ranking and final sizing now receive the same current available equity, so projected net profit, candidate comparison, lots and units all describe the executable plan. The regression reproduced the old 60-lot projection versus 6-lot final BANKNIFTY plan and now requires them to match.
+- Verification evidence after the integration:
+  - TDD red runs proved missing runtime orchestration, missing index persistence/routing, absent UI index visibility, incorrect threshold propagation and the old close-to-close divergence behavior;
+  - focused regression suites were made green without weakening assertions;
+  - complete backend suite: 183 passed, with one existing Starlette/httpx deprecation warning;
+  - complete frontend suite: 9 passed;
+  - TypeScript/Vite production build succeeded;
+  - `git diff --check` passed (Windows line-ending notices only);
+  - local instrument mapping/request smoke checks succeeded with no network order action.
+- User-owned `config.json` backtest dates remain unchanged at 2026-06-09 through 2026-07-13. No files were staged or committed, and unrelated `docs/superpowers/` and logs were not added to the implementation scope.
+- Final reservation-failure review added an explicit PAPER entry helper used by both initial entries and rotations. If a simulated fill raises before a Trade is created, the global reservation is released and its engine token is cleared, preventing a flat engine from remaining permanently blocked. During rotation, the existing reservation now remains active across the close-to-replacement transition and is released only if replacement execution fails or a post-close LIVE daily-stop check blocks re-entry.
+- Final verification also imported/compiled the production engine after removal of the old NIFTY-only scanner. That caught and corrected two orphaned indentation fragments before the full suite was accepted. Frontend verification remained 9 passing tests and a successful Vite production build; `execution_mode` read back as PAPER, `live_trading_enabled` remained false, `execution/broker_executor.py` remained unchanged, and the user-owned backtest dates were re-read directly from `config.json`.
+
+### 2026-07-16 — ATM-only screenshot traced to stale service process
+
+- User reported that Pair Inspector still showed only NIFTY 24150 CE / 24150 PE and questioned whether the cross-strike implementation was active.
+- Read-only API evidence confirmed that the browser was connected to the pre-change Uvicorn process: `/api/indices` reported only NIFTY as `runtime_connected=true`, the activity console logged `1 of 1 pairs`, and the captured rows were all the legacy matched-ATM pair. The screenshot therefore represented the old in-memory Python code, not the current workspace implementation.
+- Independent current-source verification generated 25 NIFTY pairs for spot 24,128 with ATM 24,150. The set included ATM/cross layouts such as 24,150 CE / 24,350 PE, ITM/cross layouts such as 23,950 CE / 24,150 PE, and the deepest 23,950 CE / 24,350 PE combination. The focused template/feed/runtime suite passed 8 tests.
+- Before restarting, `/api/runtime` confirmed PAPER mode, RUNNING state and no active position. The PAPER engine was stopped through its API, the managed Windows UI service was restarted, and the PAPER engine was restored to RUNNING. No broker write route was invoked.
+- Fresh-process verification now reports all five indices `runtime_connected=true`. Runtime logs mapped BANKNIFTY 758 contracts, FINNIFTY 308, MIDCPNIFTY 524, NIFTY 436 and NIFTYNXT50 720, with validated per-index lots and strike steps.
+- Restarting resets in-memory completed candles. The fresh runtime showed all five indices collecting candles together and reached 1/10 at the first check; it will not produce a new eligible diagnostic scan until each ready index has ten completed one-minute spot candles. Old ATM-only diagnostic rows remain historical capture data until capture is restarted or subsequent rows are recorded.
+- A separate static React warning still says only NIFTY is connected. That text is stale presentation copy and is not the runtime source of truth; changing it was not performed during this verification-only request.
+
+### 2026-07-16 — Pair Inspector redesign investigation started
+
+- User reported an excessively long Pair Inspector, requested a maximum of 20 visible columns with scrolling, observed that most captured rows belong to BANKNIFTY, requested an index-wise live cross-strike-selection tile, and requested a complete visual architecture/data-flow diagram.
+- Read-only API inspection found 275 captured rows but only 19 unique fields. The overwhelming BANKNIFTY distribution is real: BANKNIFTY had 255 rows while FINNIFTY, MIDCPNIFTY, NIFTY and NIFTYNXT50 had five each.
+- Root cause was traced to diagnostic capture ordering rather than the scanners: `_record_multi_index_diagnostics` flattens scans in sorted symbol order and slices the first global Top 5/10 rows. BANKNIFTY is first alphabetically and therefore consumes nearly every capture allocation. The existing UI also renders every accumulated row in one unbounded table, which explains the extreme vertical length. Horizontal overflow exists, but the component dynamically unions every field and has no explicit ordered 20-column contract, height cap, pagination or index grouping.
+- Current feed behavior was confirmed to be dynamic rather than fixed-strike: each polling cycle derives each index's ATM from its current spot and requests ATM plus ITM1–ITM4 CE below ATM and PE above ATM. When spot crosses an index strike step, the requested numeric strike set moves with the new ATM. The requested tile should expose this server-authoritative current universe instead of recomputing it in React.
+- Design direction under discussion: fair Top 5/10 per index, index tabs/summary counts, a bounded/paginated table with no more than 20 ordered visible columns, downloads retaining full detail, and a separate per-index live strike-universe tile showing spot, ATM, expiry, CE/PE numeric strikes, pair count, readiness and tradable/observe-only permission.
+- The supplied Codex task identifier `019f65d1-b3a5-7333-9aeb-e79ec88ad561` could not be resolved through the available local thread index, so no claims from that other project were imported. User may need to provide a valid thread link/id or paste its UI decisions.
+- User explicitly invoked `find-skills` and `using-superpowers`. Skills discovery found Anthropic's `frontend-design` skill (669.2K installs, 161.4K GitHub stars) and Vercel's `web-design-guidelines` skill (466.9K installs, 29.1K stars) as credible candidates; neither was installed without user approval. The required brainstorming/design approval gate is active, so no UI or trading code was changed in this response.
+- User declined the token-intensive browser visual companion and requested documents instead. The architecture will therefore be delivered as a Mermaid flowchart and structured design document after the remaining Pair Inspector organization choice is resolved. No browser companion was opened.
+- User subsequently approved opening the browser visual companion because the layout decision was not practical to review in text. A local key-protected companion was started outside the Git working tree under the Codex visualizations directory, and the first screen presents three realistic Pair Inspector structures: full-width index tabs (recommended), strike sidebar plus table, and overview cards plus detail drawer. Every option assumes fair Top 5/10 per index, a maximum of 20 ordered visible columns, bounded vertical height/pagination, horizontal scrolling, and dynamic server-authoritative strike-universe tiles.
+- A second attempt searched the 100 most recent accessible Codex threads; session identifier `019f65d1-b3a5-7333-9aeb-e79ec88ad561` was still absent. Its discussion and GitHub repository links therefore remain unreviewed. The user must provide a resolvable task link/id or paste the repositories before they can influence the design.
+
+### 2026-07-16 — External UI handover verified, Layout A selected, architecture presented
+
+- User attached `C:\Users\LENOVO\Documents\UI development\UI_DEVELOPMENT_HANDOVER.md`. Read-only filesystem verification established that `UI development` and `chatgpt_auto_trader` are separate Git roots. The UI-development repository contains only the untracked handover and an empty `.agents` directory; it did not install agents or write code into the trading repository. A Codex project name alone does not grant cross-project writes; the task's configured workspace/root determines access.
+- The handover acknowledged that its initial AutoTrader-specific expansion was invented and corrected it to UI-only recommendations. No external package, repository, plugin or agent was installed by that other task.
+- Browser interaction events recorded repeated selection of **Layout A — full-width index tabs**. This is now the approved direction for further design: fluid desktop width, index summary/tabs, server-authoritative live strike-universe tiles, and one bounded table per selected index.
+- External repository validation:
+  - `VoltAgent/awesome-codex-subagents`: approximately 5.7K stars, MIT, 171+ Codex-native agent definitions, but maintainers explicitly state agents are provided as-is and not security/correctness guaranteed. Installing the full collection was rejected as unnecessary and context-heavy.
+  - `nexu-io/open-design`: approximately 78.7K stars, Apache-2.0, local-first design desktop/MCP platform with Codex support. It was judged credible but excessive for the immediate diagnostic UI fix because it adds a separate design runtime while the approved visual companion already covers prototype review.
+- Installed only the project-scoped, read-only VoltAgent `ui-designer` definition at `.codex/agents/ui-designer.toml`. Its TOML parsed successfully, it cannot write files when invoked, and it will be available after a Codex session refresh. The `ui-ux-tester`, Open Design MCP, shadcn, chart libraries and generative-UI stacks were not installed.
+- The browser companion now displays a complete architecture flow from Windows Scheduled Task → FastAPI/React safety boundary → five-index spot/option acquisition → dynamic ATM/ITM strike resolution → isolated caches/candles → deterministic per-index scanning → cross-strike and safety gates → fair diagnostic capture → global coordinator/reservation → PAPER execution/recovery/WebSocket UI.
+- Architectural truth made explicit: market quotes for all indices are combined into one bounded request, but strategy scans currently execute sequentially in a deterministic loop across isolated index contexts; they are not five parallel threads. This is intentional to reduce shared-state races for the small five-index/25-pair workload.
+- Proposed Pair Inspector contract awaiting final design approval:
+  - Top 5/10 is applied independently per selected index and scan, eliminating BANKNIFTY's alphabetical capture monopoly;
+  - bounded per-index history instead of an indefinitely growing single table;
+  - exactly 20 ordered visible columns maximum, 10 rows per page, fixed-height viewport, vertical pagination, horizontal scrolling and sticky Index/CE/PE/Result columns;
+  - overflow/full fields move to a row detail drawer while CSV/JSON retain full fidelity;
+  - a server-generated index-universe snapshot exposes current spot, ATM, expiry, actual five CE and five PE strikes, pair count, readiness, permission and update age for every index;
+  - numeric strike lists are recalculated from live spot and each index's strike step every feed cycle, never hard-coded in React.
+- User authorized publishing the current work to GitHub. Scope review excluded `docs/superpowers/`, `logs/`, PID/runtime files and visual-companion artifacts; intended scope includes the multi-index/PAPER-safety implementation, tests, UI/service updates, handover and project-scoped read-only UI agent.
+- GitHub CLI 2.96.0 was installed successfully through Winget because it was absent. `gh auth status` then confirmed no authenticated GitHub host. Browser login could not complete through the non-interactive tool session and was terminated without staging, committing or pushing. User must run `gh auth login` in their own PowerShell and confirm completion before publication continues.

@@ -82,6 +82,10 @@ class TradingConfig:
     health_check_api_latency_ms: int = 500
     health_check_spread_max: float = 1.50
     health_check_cache_stale_sec: int = 10
+    directional_max_spread_pct: float = 0.02
+    sideways_max_spread_pct: float = 0.05
+    paper_limit_fill_timeout_seconds: float = 15.0
+    paper_limit_fill_poll_seconds: float = 1.0
 
     # App controls
     execution_mode: str = "BACKTEST"  # BACKTEST | PAPER | LIVE

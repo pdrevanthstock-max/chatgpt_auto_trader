@@ -7,7 +7,7 @@ export function ActivePosition({ position }: { position: ActivePositionView | nu
     {!position ? <div className="empty-state"><strong>No active position</strong><p>Risk monitoring remains independent of browser state.</p></div> : <>
       <div className="quantity-banner"><strong>{position.lots} lots</strong><strong>{position.units_per_leg.toLocaleString("en-IN")} units / leg</strong></div>
       <div className="detail-grid">
-        <div><span>Trade</span><strong>{position.trade_id}</strong></div><div><span>Direction</span><strong>{position.direction}</strong></div>
+        <div><span>Index</span><strong>{position.index_symbol}</strong></div><div><span>Trade</span><strong>{position.trade_id}</strong></div><div><span>Direction</span><strong>{position.direction}</strong></div>
         <div><span>CE</span><strong>{position.ce_strike} @ {currency(position.ce_entry)}</strong></div><div><span>PE</span><strong>{position.pe_strike} @ {currency(position.pe_entry)}</strong></div>
         <div><span>Hard stop</span><strong>{currency(position.hard_stop_loss)}</strong></div><div><span>Entry</span><strong>{dateTime(position.entry_time)}</strong></div>
       </div>

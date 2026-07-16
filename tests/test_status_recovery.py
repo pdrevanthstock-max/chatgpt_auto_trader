@@ -3,6 +3,8 @@ from pathlib import Path
 from unittest.mock import patch, MagicMock
 from datetime import datetime, time
 from execution.crash_recovery import CrashRecovery
+from core.enums import MarketRegime, TradeDirection, TradePhase
+from core.models import Trade
 
 def test_status_recovery_date_and_time_validation(tmp_path):
     # Setup CrashRecovery with a temp filepath
@@ -76,3 +78,36 @@ def test_legacy_unscoped_state_is_never_loaded_into_live(tmp_path):
 
     assert recovery.load_state(execution_mode="LIVE") == (0.0, None)
     assert recovery.load_state(execution_mode="PAPER") == (-36_365.35, None)
+
+
+def test_live_restart_preserves_mode_open_units_and_hard_stop(tmp_path):
+    recovery = CrashRecovery(filepath=tmp_path / "persistent_state.json")
+    trade = Trade(
+        id="live-partial-exit",
+        execution_mode="LIVE",
+        direction=TradeDirection.LONG_CE,
+        strike_ce=24_300,
+        strike_pe=24_300,
+        entry_ce_price=100.0,
+        entry_pe_price=98.0,
+        quantity=1,
+        lot_size=65,
+        entry_time=datetime(2026, 7, 16, 10, 0),
+        regime_at_entry=MarketRegime.DIRECTIONAL,
+        phase=TradePhase.PARTIAL_EXIT,
+        risk_capital_at_entry=40_000.0,
+        hard_stop_loss=1_200.0,
+        ce_open_units=45,
+        pe_open_units=65,
+    )
+
+    recovery.save_state(-500.0, trade, execution_mode="LIVE")
+    realized, restored = recovery.load_state(execution_mode="LIVE")
+
+    assert realized == -500.0
+    assert restored is not None
+    assert restored.execution_mode == "LIVE"
+    assert restored.phase is TradePhase.PARTIAL_EXIT
+    assert restored.ce_open_units == 45
+    assert restored.pe_open_units == 65
+    assert restored.hard_stop_loss == 1_200.0

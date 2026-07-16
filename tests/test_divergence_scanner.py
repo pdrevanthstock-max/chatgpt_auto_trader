@@ -29,21 +29,22 @@ def test_divergence_scanner_velocity_calc():
     assert pair.winning_leg == "CE"
 
 
-def test_strict_live_scanner_uses_completed_close_to_close_velocity():
+def test_strict_live_scanner_uses_latest_completed_candle_open_to_close_velocity():
     store = CompletedCandleStore()
     start = datetime(2026, 7, 15, 10, 0, 5)
-    for key, first, second in [
-        ("NIFTY:24200:CE", 100.0, 105.0),
-        ("NIFTY:24200:PE", 100.0, 98.0),
+    for key, previous_close, latest_open, latest_close in [
+        ("NIFTY:24200:CE", 90.0, 100.0, 110.0),
+        ("NIFTY:24200:PE", 95.0, 100.0, 105.0),
     ]:
-        store.add_tick(key, start, first)
-        store.add_tick(key, start + timedelta(minutes=1), second)
-        store.add_tick(key, start + timedelta(minutes=2), second)
+        store.add_tick(key, start, previous_close)
+        store.add_tick(key, start + timedelta(minutes=1), latest_open)
+        store.add_tick(key, start + timedelta(minutes=1, seconds=30), latest_close)
+        store.add_tick(key, start + timedelta(minutes=2), latest_close)
 
     result = DivergenceScanner(
         candle_store=store, require_completed=True
     ).scan_candidates([(24200, 24200)])
 
-    assert result[0].ce_velocity == 5.0
-    assert result[0].pe_velocity == -2.0
-    assert result[0].divergence == 7.0
+    assert result[0].ce_velocity == 10.0
+    assert result[0].pe_velocity == 5.0
+    assert result[0].divergence == 5.0

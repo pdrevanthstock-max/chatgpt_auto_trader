@@ -1,7 +1,7 @@
 import logging
 from typing import List, Optional
 from core.models import CandidatePair, ScoredCandidate
-from data.market_cache import market_cache
+from data.market_cache import MarketCache, market_cache
 from config.settings import TradingConfig
 from strategy.position_sizer import PositionSizer
 from strategy.profitability import ProfitabilityCalculator, ProfitabilityInput
@@ -13,20 +13,24 @@ class PairRanker:
     Ranks surviving candidate pairs by projected net profit after brokerage.
     Attaches a score confidence percentage to each.
     """
-    def __init__(self) -> None:
+    def __init__(self, cache: MarketCache | None = None) -> None:
+        self.cache = cache or market_cache
         self.last_decisions: dict[tuple[object, object], dict[str, object]] = {}
 
     def rank_candidates(
         self,
         candidates: List[CandidatePair],
         config: TradingConfig,
-        momentum_multiplier: float = 1.0
+        momentum_multiplier: float = 1.0,
+        lot_size: int | None = None,
+        available_capital: float | None = None,
     ) -> Optional[ScoredCandidate]:
         if not candidates:
             self.last_decisions = {}
             return None
 
-        chain = market_cache.get_option_chain()
+        chain = self.cache.get_option_chain()
+        contract_lot_size = int(lot_size or config.nifty_lot_size)
         scored_list: List[ScoredCandidate] = []
 
         self.last_decisions = {}
@@ -64,7 +68,13 @@ class PairRanker:
                 }
                 continue
 
-            lots = PositionSizer().calculate_lots(ce_price, pe_price, config)
+            lots = PositionSizer().calculate_lots(
+                ce_price,
+                pe_price,
+                config,
+                lot_size=contract_lot_size,
+                available_capital=available_capital,
+            )
             if lots <= 0:
                 self.last_decisions[(candidate.ce_strike, candidate.pe_strike)] = {
                     "result": "FAIL", "reason": "ZERO_SAFE_QUANTITY"
@@ -78,7 +88,7 @@ class PairRanker:
                 projected_ce_bid=max(0.05, ce_bid * (1.0 + candidate.ce_velocity * momentum_multiplier / 100.0)),
                 projected_pe_bid=max(0.05, pe_bid * (1.0 + candidate.pe_velocity * momentum_multiplier / 100.0)),
                 lots=lots,
-                lot_size=config.nifty_lot_size,
+                lot_size=contract_lot_size,
                 freeze_units=config.max_units_per_leg,
                 slippage_per_unit_per_fill=config.projected_slippage_per_unit_per_fill,
                 minimum_net_profit=config.minimum_projected_net_profit,
@@ -99,7 +109,10 @@ class PairRanker:
                 continue
 
             # Calculate confidence score (deterministic heuristics)
-            confidence = 60.0  # Base confidence
+            # A profitable, executable candidate starts at the minimum passing
+            # confidence. Volume/OI improve ranking but their absence does not
+            # act as a second hidden liquidity rejection.
+            confidence = 70.0
             
             # Check spreads
             ce_bid = ce_data.get("bid", 0.0)

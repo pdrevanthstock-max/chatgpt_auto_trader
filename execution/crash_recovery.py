@@ -73,10 +73,26 @@ class CrashRecovery:
         try:
             with open(state_filepath, "r", encoding="utf-8") as f:
                 state = json.load(f)
+
+            stored_mode = str(state.get("execution_mode") or "").upper()
+            requested_mode = str(execution_mode or "").upper()
+            if stored_mode and requested_mode and stored_mode != requested_mode:
+                logger.error(
+                    "CrashRecovery: Stored execution mode does not match the requested mode; "
+                    "state rejected."
+                )
+                return 0.0, None
             
             realized_pnl = state.get("realized_pnl", 0.0)
             trade_data = state.get("active_trade")
-            active_trade = self._deserialize_trade(trade_data) if trade_data else None
+            active_trade = (
+                self._deserialize_trade(
+                    trade_data,
+                    execution_mode=requested_mode or stored_mode or None,
+                )
+                if trade_data
+                else None
+            )
             
             logger.info("CrashRecovery: State loaded successfully from disk.")
             return realized_pnl, active_trade
@@ -132,6 +148,8 @@ class CrashRecovery:
     def _serialize_trade(self, trade: Trade) -> Dict[str, Any]:
         return {
             "id": trade.id,
+            "execution_mode": str(getattr(trade, "execution_mode", "UNKNOWN")).upper(),
+            "index_symbol": str(getattr(trade, "index_symbol", "NIFTY")).upper(),
             "direction": trade.direction.value,
             "strike_ce": trade.strike_ce,
             "strike_pe": trade.strike_pe,
@@ -160,9 +178,17 @@ class CrashRecovery:
             "exit_reason": trade.exit_reason.value if trade.exit_reason else None
         }
 
-    def _deserialize_trade(self, data: Dict[str, Any]) -> Trade:
+    def _deserialize_trade(
+        self,
+        data: Dict[str, Any],
+        execution_mode: Optional[str] = None,
+    ) -> Trade:
         trade = Trade(
             id=data["id"],
+            execution_mode=str(
+                execution_mode or data.get("execution_mode", "UNKNOWN")
+            ).upper(),
+            index_symbol=str(data.get("index_symbol", "NIFTY")).upper(),
             direction=TradeDirection(data["direction"]),
             strike_ce=data["strike_ce"],
             strike_pe=data["strike_pe"],

@@ -117,22 +117,34 @@ def test_validator_rejects_pair_when_both_contracts_are_otm():
     assert "both OTM" in reason
 
 
-def test_validator_rejects_sideways_entry_near_expiry():
+def test_validator_allows_sideways_expiry_entry_when_template_is_atm_itm_safe():
     market_cache.clear()
     now = datetime.now()
     market_cache.update_spot(24_300.0, now)
     market_cache.set_active_expiry(date.today())
-    market_cache.update_option(24_300, "CE", _valid_quote(now))
-    market_cache.update_option(24_300, "PE", _valid_quote(now))
+    market_cache.update_option(24_250, "CE", _valid_quote(now))
+    market_cache.update_option(24_350, "PE", _valid_quote(now))
     plan = _plan()
     plan.regime = MarketRegime.SIDEWAYS
+    plan.order_type = OrderType.LIMIT
+    plan.ce_limit_price = 101.0
+    plan.pe_limit_price = 101.0
+    plan.scored_candidate = ScoredCandidate(
+        ce_strike=24_250,
+        pe_strike=24_350,
+        ce_velocity=2.0,
+        pe_velocity=1.0,
+        divergence=1.0,
+        winning_leg="CE",
+        projected_net_profit=500.0,
+        confidence=80.0,
+    )
 
     valid, reason = ExecutionValidator().validate_entry(
         plan, 0.0, None, TradingConfig(execution_mode="PAPER")
     )
 
-    assert valid is False
-    assert "expiry guard" in reason
+    assert valid is True, reason
 
 
 def test_validator_blocks_dynamic_quantity_when_asks_exceed_available_capital():

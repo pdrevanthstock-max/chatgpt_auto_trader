@@ -15,12 +15,16 @@ class PositionSizer:
         pe_price: float,
         config: TradingConfig,
         available_capital: float | None = None,
+        lot_size: int | None = None,
     ) -> int:
         if ce_price <= 0.0 or pe_price <= 0.0:
             return 0
 
         combined_premium = ce_price + pe_price
-        lot_cost = combined_premium * config.nifty_lot_size
+        contract_lot_size = int(lot_size or config.nifty_lot_size)
+        if contract_lot_size <= 0:
+            return 0
+        lot_cost = combined_premium * contract_lot_size
 
         if lot_cost <= 0.0:
             return 0
@@ -28,7 +32,7 @@ class PositionSizer:
         capital = config.total_capital if available_capital is None else max(0.0, available_capital)
         deployable_capital = capital * config.max_capital_deployment_pct
         capital_lots = int(math.floor(deployable_capital / lot_cost))
-        unit_ceiling_lots = int(math.floor(config.max_units_per_leg / config.nifty_lot_size))
+        unit_ceiling_lots = int(math.floor(config.max_units_per_leg / contract_lot_size))
         lots = min(capital_lots, unit_ceiling_lots)
         
         logger.info(

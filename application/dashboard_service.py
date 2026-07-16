@@ -91,6 +91,7 @@ class DashboardService:
         return {
             "trade_id": getattr(trade, "display_id", getattr(trade, "id", "")),
             "execution_mode": str(getattr(trade, "execution_mode", "UNKNOWN")).upper(),
+            "index_symbol": str(getattr(trade, "index_symbol", "NIFTY")).upper(),
             "direction": getattr(getattr(trade, "direction", None), "value", "UNKNOWN"),
             "regime": getattr(getattr(trade, "regime_at_entry", None), "value", "UNKNOWN"),
             "phase": getattr(getattr(trade, "phase", None), "value", "UNKNOWN"),

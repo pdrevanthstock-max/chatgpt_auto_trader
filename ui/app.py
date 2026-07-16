@@ -5,7 +5,7 @@ import logging
 import time
 import threading
 import asyncio
-from typing import List, Dict, Any, Tuple, Optional
+from typing import List, Dict, Optional
 from datetime import datetime, date, timedelta, time as datetime_time
 from pathlib import Path
 import streamlit as st
@@ -17,40 +17,32 @@ if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
 from config.settings import TradingConfig, APP_NAME, APP_VERSION
-from core.enums import ExecutionMode, MarketRegime, TradePhase, ExitReason, SignalType, TradeDirection, OrderType
-from core.models import Trade, TradePlan, ExecutionSignal, PairedCandle, ScoredCandidate
+from core.enums import ExecutionMode, MarketRegime, TradePhase, ExitReason, SignalType
+from core.models import Trade, ExecutionSignal
 from data.historical_loader import HistoricalLoader
 from backtest.engine import BacktestEngine
 from backtest.results import BacktestResults
 from database.trade_store import TradeStore
 from database.capital_ledger import CapitalLedger
 from application.performance_service import PerformancePeriod, PerformanceService
-from application.scan_diagnostics import build_scan_diagnostics
-from data.candle_store import completed_candles, spot_candle_key
+from application.activity_journal import ActivityJournal
+from application.market_session import MarketPhase, MarketSessionSchedule
+from application.index_scanner import IndexOpportunity
+from application.index_selection import IndexSelectionService
+from application.multi_index_runtime import MultiIndexRuntime
+from application.position_reservation import PositionReservation
+from core.index_registry import IndexRegistry
+from data.market_cache import market_caches
 from reporting.excel_export import ExcelExporter
 from monitoring.health_monitor import HealthMonitor
 
-from strategy.pair_candidate_generator import PairCandidateGenerator
-from strategy.liquidity_filter import LiquidityFilter
-from strategy.divergence_scanner import DivergenceScanner
-from strategy.entry_signal import EntrySignal
-import strategy.pair_ranker
-importlib.reload(strategy.pair_ranker)
-from strategy.pair_ranker import PairRanker
-from strategy.regime_detector import RegimeDetector
-from strategy.market_features import MarketFeatureCalculator
-from strategy.trade_planner import TradePlanner
-from strategy.position_guard import PositionGuard
 from strategy.daily_circuit_breaker import DailyCircuitBreaker
-from strategy.position_sizer import PositionSizer
 from strategy.live_readiness import evaluate_live_readiness
-from strategy.order_type_selector import OrderTypeSelector
 from strategy.exit_manager import ExitManager
 from strategy.hedge_cut_manager import HedgeCutManager
 from strategy.single_leg_exit_manager import SingleLegExitManager
 from strategy.rotation_engine import RotationEngine
 from strategy.decision_memory import DecisionMemory
-from execution.execution_validator import ExecutionValidator
 from execution.execution_queue import ExecutionQueue
 from execution.paper_executor import PaperExecutor
 from execution.broker_executor import BrokerExecutor
@@ -136,7 +128,12 @@ class LiveEngine:
         if self.execution_mode_lock not in {None, ExecutionMode.PAPER.value}:
             raise ValueError("The web runtime supports only a PAPER execution-mode lock.")
         self.diagnostic_capture = diagnostic_capture
-        self.index_selection = index_selection
+        self.index_registry = IndexRegistry.default()
+        self.index_selection = index_selection or IndexSelectionService(self.index_registry)
+        self.market_caches = market_caches
+        self.position_reservation = PositionReservation()
+        self._position_reservation_token: Optional[str] = None
+        self._paper_daily_threshold_active = False
         self.thread: Optional[threading.Thread] = None
         self.config = TradingConfig.load()
         if self.execution_mode_lock:
@@ -147,27 +144,19 @@ class LiveEngine:
         # Thread-safe activity log list
         self._log_lock = threading.Lock()
         self.activity_log: List[str] = []
+        self.activity_journal = ActivityJournal(project_root / "logs" / "engine-activity.log")
+        self._activity_throttle: Dict[str, datetime] = {}
+        self.market_schedule = MarketSessionSchedule()
         
-        # Strategy components
-        self.generator = PairCandidateGenerator()
-        self.liq_filter = LiquidityFilter()
-        self.scanner = DivergenceScanner(require_completed=True)
-        self.entry_signal = EntrySignal()
-        self.ranker = PairRanker()
-        self.regime_detector = RegimeDetector()
-        self.planner = TradePlanner()
-        self.pos_guard = PositionGuard()
+        # Position-risk components; entry scanners live in MultiIndexRuntime.
         self.circuit_breaker = DailyCircuitBreaker()
-        self.sizer = PositionSizer()
-        self.order_selector = OrderTypeSelector()
         self.exit_manager = ExitManager()
         self.hedge_cut_manager = HedgeCutManager()
         self.single_leg_exit_manager = SingleLegExitManager()
         self.rotation_engine = RotationEngine()
         self.decision_memory = DecisionMemory()
-        self.validator = ExecutionValidator()
         self.queue = ExecutionQueue()
-        self.paper_executor = PaperExecutor()
+        self._configure_paper_executors()
         self.broker_executor: Optional[BrokerExecutor] = None
         self.recovery = CrashRecovery()
         self.health_monitor = HealthMonitor()
@@ -179,14 +168,104 @@ class LiveEngine:
             execution_mode=self.config.execution_mode
         )
         
-        # Regime detector windows
-        self.spot_closes = []
-        self.spot_highs = []
-        self.spot_lows = []
-        self.vwap_values = []
-        self.atr_values = []
         self._last_entry_scan_at: Optional[datetime] = None
-        self._last_entry_candle_at: Optional[datetime] = None
+        self._configure_multi_index_runtime()
+
+    def _configure_paper_executors(self) -> None:
+        self.paper_executors = {
+            symbol: PaperExecutor(
+                chain_provider=self.market_caches.get(symbol).get_option_chain,
+                limit_fill_timeout_seconds=self.config.paper_limit_fill_timeout_seconds,
+                limit_fill_poll_seconds=self.config.paper_limit_fill_poll_seconds,
+            )
+            for symbol in self.index_registry.symbols
+        }
+        # Backward-compatible NIFTY alias for the legacy Streamlit manual action.
+        self.paper_executor = self.paper_executors["NIFTY"]
+
+    def _record_multi_index_diagnostics(self, scans) -> None:
+        if self.diagnostic_capture is None:
+            return
+        snapshot = self.diagnostic_capture.snapshot()
+        if not snapshot.capturing:
+            return
+        rows = [
+            row
+            for scan in scans
+            for row in scan.diagnostics
+            if isinstance(row, dict)
+        ]
+        self.diagnostic_capture.record(rows[: snapshot.top_count])
+
+    def _configure_multi_index_runtime(self) -> None:
+        self.multi_index_runtime = MultiIndexRuntime(
+            registry=self.index_registry,
+            caches=self.market_caches,
+            selection=self.index_selection,
+            reservation=self.position_reservation,
+            config=self.config,
+            execute=self._queue_multi_index_entry,
+            record_diagnostics=self._record_multi_index_diagnostics,
+        )
+
+    def _queue_multi_index_entry(
+        self, index_symbol: str, candidate: object, reservation_token: str
+    ) -> bool:
+        execution_mode = self.session_execution_mode or self.config.execution_mode
+        if execution_mode != ExecutionMode.PAPER.value:
+            self.log_activity(
+                "MULTI-INDEX ENTRY BLOCKED: this runtime is PAPER-only; no broker order was sent."
+            )
+            return False
+        plan = getattr(candidate, "plan", None)
+        if plan is None or str(getattr(plan, "index_symbol", "")).upper() != str(index_symbol).upper():
+            self.log_activity("MULTI-INDEX ENTRY BLOCKED: candidate/index context mismatch.")
+            return False
+        plan.post_daily_sl = bool(self._paper_daily_threshold_active)
+        self.queue.enqueue(ExecutionSignal(
+            type=SignalType.ENTRY,
+            trade_plan=plan,
+            reservation_token=reservation_token,
+        ))
+        return True
+
+    def _cache_for_trade(self, trade: Trade):
+        return self.market_caches.get(getattr(trade, "index_symbol", "NIFTY"))
+
+    def _paper_executor_for_trade(self, trade: Trade):
+        return self.paper_executors[str(getattr(trade, "index_symbol", "NIFTY")).upper()]
+
+    def _release_reservation(self, token: Optional[str] = None) -> None:
+        owner = token or self._position_reservation_token
+        if owner:
+            self.position_reservation.release(owner)
+        if owner == self._position_reservation_token:
+            self._position_reservation_token = None
+
+    def _execute_paper_plan(
+        self,
+        plan: TradePlan,
+        now: datetime,
+        reservation_token: Optional[str] = None,
+    ) -> Trade:
+        try:
+            return self.paper_executors[str(plan.index_symbol).upper()].execute_entry(
+                plan, now
+            )
+        except Exception:
+            self._release_reservation(reservation_token)
+            raise
+
+    def _reserve_recovered_position(self) -> None:
+        if not (self.active_trade and self.active_trade.is_open):
+            return
+        if self.position_reservation.snapshot().state != "EMPTY":
+            return
+        token = self.position_reservation.try_reserve(
+            f"RECOVERED:{getattr(self.active_trade, 'index_symbol', 'NIFTY')}:{self.active_trade.id}"
+        )
+        if token and self.position_reservation.activate(token):
+            self._position_reservation_token = token
 
     def log_activity(self, message: str) -> None:
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -195,6 +274,16 @@ class LiveEngine:
             self.activity_log.append(formatted)
             if len(self.activity_log) > 200:
                 self.activity_log.pop(0)
+        self.activity_journal.append(formatted)
+
+    def _log_activity_throttled(
+        self, key: str, message: str, interval_seconds: int, now: Optional[datetime] = None
+    ) -> None:
+        observed_at = now or datetime.now()
+        last = self._activity_throttle.get(key)
+        if last is None or (observed_at - last).total_seconds() >= interval_seconds:
+            self._activity_throttle[key] = observed_at
+            self.log_activity(message)
 
     def current_strategy_equity(self) -> float:
         base_capital = (
@@ -256,31 +345,24 @@ class LiveEngine:
         else:
             self.broker_executor = None
 
-        # Re-instantiate all strategy modules to pick up disk code modifications on startup
-        self.generator = PairCandidateGenerator()
-        self.liq_filter = LiquidityFilter()
-        self.scanner = DivergenceScanner(require_completed=True)
-        self.entry_signal = EntrySignal()
-        self.ranker = PairRanker()
-        self.regime_detector = RegimeDetector()
-        self.planner = TradePlanner()
-        self.pos_guard = PositionGuard()
+        # Re-instantiate position-risk modules on every stopped-to-running transition.
         self.circuit_breaker = DailyCircuitBreaker()
-        self.sizer = PositionSizer()
-        self.order_selector = OrderTypeSelector()
         self.exit_manager = ExitManager()
         self.hedge_cut_manager = HedgeCutManager()
         self.single_leg_exit_manager = SingleLegExitManager()
         self.rotation_engine = RotationEngine()
+        self._configure_paper_executors()
+        self.position_reservation = PositionReservation()
+        self._position_reservation_token = None
+        self._configure_multi_index_runtime()
         
         with self._log_lock:
             self.activity_log.clear()
         self._last_entry_scan_at = None
-        self._last_entry_candle_at = None
+        self._activity_throttle.clear()
             
         self.log_activity("Clearing stale market cache data...")
-        from data.market_cache import market_cache
-        market_cache.clear()
+        self.market_caches.clear()
 
         self.log_activity("Initializing pre-flight credentials checks...")
         
@@ -318,8 +400,7 @@ class LiveEngine:
             self.thread.join(timeout=2.0)
         
         self.log_activity("Clearing market cache data...")
-        from data.market_cache import market_cache
-        market_cache.clear()
+        self.market_caches.clear()
 
         self.log_activity("LiveEngine stopped background thread loop.")
         logger.info("LiveEngine stopped background thread loop.")
@@ -333,6 +414,7 @@ class LiveEngine:
         self.realized_pnl, self.active_trade = self.recovery.load_state(
             execution_mode=self.session_execution_mode
         )
+        self._reserve_recovered_position()
         if self.active_trade:
             self.log_activity(f"Crash Recovery: Recovered active trade {display_trade_id(self.active_trade)} ({self.active_trade.phase.value})")
         else:
@@ -340,7 +422,11 @@ class LiveEngine:
         
         # Start Live Feed & Queue worker
         from data.live_feed import LiveFeed
-        self.feed = LiveFeed(engine=self)
+        self.feed = LiveFeed(
+            engine=self,
+            index_registry=self.index_registry,
+            cache_registry=self.market_caches,
+        )
         self.feed.start()
         self.log_activity("Live market-data feed initialization requested.")
         
@@ -358,6 +444,7 @@ class LiveEngine:
                 refreshed.execution_mode = self.session_execution_mode
                 refreshed.total_capital = self.session_allocated_capital
                 self.config = refreshed
+                self.multi_index_runtime.update_config(refreshed)
                 self._run_strategy_cycle()
                 time.sleep(max(1, self.config.risk_monitor_interval_seconds))
             except Exception as e:
@@ -369,43 +456,25 @@ class LiveEngine:
         self.queue.stop_background_worker()
 
     def _run_strategy_cycle(self) -> None:
+        """Monitor one active position every tick; scan selected indices on cadence."""
         now = datetime.now()
-        current_time_only = now.time()
-        
+        current_time = now.time()
+        session_status = self.market_schedule.at(now)
         start_hour, start_min = map(int, self.config.scan_start.split(":"))
         end_hour, end_min = map(int, self.config.scan_end.split(":"))
-        entry_cutoff_hour, entry_cutoff_min = map(int, self.config.last_entry_time.split(":"))
-        
-        trading_hours = datetime_time(start_hour, start_min) <= current_time_only < datetime_time(end_hour, end_min)
-        last_entry_passed = current_time_only >= datetime_time(entry_cutoff_hour, entry_cutoff_min)
-        is_preclose = current_time_only >= datetime_time(15, 0)
+        cutoff_hour, cutoff_min = map(int, self.config.last_entry_time.split(":"))
+        trading_hours = datetime_time(start_hour, start_min) <= current_time < datetime_time(end_hour, end_min)
+        is_preclose = current_time >= datetime_time(15, 0)
 
-        # Get spot price from MarketCache
-        from data.market_cache import market_cache
-        spot_price, _ = market_cache.get_spot()
-        if spot_price <= 0.0:
-            self.log_activity("Waiting for spot price cache update...")
-            return
-            
-        atm_strike = market_cache.get_atm_strike()
-
-        spot_candles = completed_candles.latest(spot_candle_key("NIFTY"), count=20)
-        features_ready = len(spot_candles) >= 10
-        if features_ready:
-            features = MarketFeatureCalculator.calculate(spot_candles)
-            regime, spot_trend = self.regime_detector.detect_regime(
-                spot_closes=list(features.closes),
-                spot_highs=list(features.highs),
-                spot_lows=list(features.lows),
-                vwap_values=list(features.vwap_values),
-                atr_values=list(features.atr_values),
-                atm_strike=atm_strike,
+        if not (self.active_trade and self.active_trade.is_open) and not session_status.entries_allowed:
+            self._log_activity_throttled(
+                f"market-phase:{session_status.phase.value}",
+                session_status.message,
+                session_status.status_interval_seconds,
+                now,
             )
-        else:
-            regime, spot_trend = MarketRegime.SIDEWAYS, "SIDEWAYS"
+            return
 
-        # Scope the daily stop to the current IST trading date. Historical
-        # realized P&L remains part of equity, not today's breaker input.
         daily_active_pnl = (
             self.active_trade.net_pnl
             if self.active_trade and self.active_trade.is_open
@@ -418,297 +487,225 @@ class LiveEngine:
             now=now,
             active_pnl=daily_active_pnl,
         )
-        current_total_pnl = daily_performance.daily_risk_pnl
-            
-        breaker_hit = self.circuit_breaker.is_breaker_triggered(current_total_pnl, self.config)
+        daily_risk_pnl = daily_performance.daily_risk_pnl
+        breaker_hit = self.circuit_breaker.is_breaker_triggered(
+            daily_risk_pnl, self.config
+        )
+        self._paper_daily_threshold_active = bool(
+            breaker_hit
+            and (self.session_execution_mode or self.config.execution_mode)
+            == ExecutionMode.PAPER.value
+        )
         if breaker_hit and self.session_execution_mode == ExecutionMode.LIVE.value:
             self.capital_ledger.latch_live_daily_stop(
-                trading_day=date.today(),
-                realized_pnl=current_total_pnl,
+                trading_day=now.date(),
+                realized_pnl=daily_risk_pnl,
                 loss_limit=-abs(self.config.daily_loss_limit),
             )
 
         if self.active_trade and self.active_trade.is_open:
-            ce_data = market_cache.get_option(self.active_trade.strike_ce, "CE")
-            pe_data = market_cache.get_option(self.active_trade.strike_pe, "PE")
-            
-            if ce_data and pe_data:
-                self.active_trade.ce_current_price = ce_data.get("bid", ce_data["last"])
-                self.active_trade.pe_current_price = pe_data.get("bid", pe_data["last"])
-                
-                # Save updated live prices and PnL to SQLite database & recovery state
-                self.store.save_trade(self.active_trade)
-                self.recovery.save_state(
-                    self.realized_pnl,
-                    self.active_trade,
-                    execution_mode=self.session_execution_mode,
+            self._monitor_active_position(
+                now=now,
+                current_time=current_time,
+                end_time=datetime_time(end_hour, end_min),
+                is_preclose=is_preclose,
+                breaker_hit=breaker_hit,
+            )
+            return
+
+        if self.session_execution_mode == ExecutionMode.LIVE.value:
+            self.log_activity(
+                "LIVE ENTRY BLOCKED: the multi-index runtime is PAPER-only; no broker order was sent."
+            )
+            return
+        if not trading_hours:
+            self._log_activity_throttled(
+                "outside-trading-hours",
+                f"Outside trading hours (09:30-15:20). Current: {now.strftime('%H:%M:%S')}",
+                60,
+                now,
+            )
+            return
+        if current_time >= datetime_time(cutoff_hour, cutoff_min):
+            self._log_activity_throttled(
+                "last-entry-passed", "Last entry time passed. Entries disabled.", 60, now
+            )
+            return
+        if (
+            self._last_entry_scan_at is not None
+            and (now - self._last_entry_scan_at).total_seconds()
+            < self.config.scan_interval_seconds
+        ):
+            return
+        self._last_entry_scan_at = now
+        if breaker_hit:
+            self.log_activity(
+                "PAPER daily loss threshold is active. Testing continues; new trades will be tagged -SL."
+            )
+
+        cycle = self.multi_index_runtime.scan(
+            now=now,
+            realized_pnl=daily_risk_pnl,
+            active_trade=None,
+            available_capital=self.current_strategy_equity(),
+        )
+        ready = [state for state in cycle.market_states if state.ready]
+        for state in cycle.market_states:
+            if not state.ready:
+                self._log_activity_throttled(
+                    f"index-wait:{state.symbol}:{state.reason}",
+                    f"{state.symbol}: waiting for market context ({state.reason}); "
+                    f"{state.completed_candles}/10 completed candles.",
+                    60,
+                    now,
                 )
-                
-                ce_p = ce_data.get("bid", ce_data["last"])
-                pe_p = pe_data.get("bid", pe_data["last"])
-                
-                self.log_activity(f"Active Position holding: {display_trade_id(self.active_trade)} ({self.active_trade.phase.value}). Combined PnL: ₹{self.active_trade.combined_pnl:.2f}")
-                
-                # Check circuit breaker hit dynamically during active trade (protect 3% capital)
-                if breaker_hit and self.config.execution_mode != ExecutionMode.PAPER.value:
-                    self.log_activity("Daily loss limit breached by active trade unrealized loss. Enqueuing emergency exit!")
-                    self.queue.enqueue(ExecutionSignal(
-                        type=SignalType.EXIT_BOTH,
-                        trade_id=self.active_trade.id,
-                        reason="CIRCUIT_BREAKER_TRIGGERED"
-                    ))
-                    return
-
-                # Check EOD flatten
-                if current_time_only >= datetime_time(end_hour, end_min):
-                    self.log_activity("EOD close cutoff reached. Enqueuing exit.")
-                    self.queue.enqueue(ExecutionSignal(
-                        type=SignalType.EXIT_BOTH,
-                        trade_id=self.active_trade.id,
-                        reason="EOD_SQUARE_OFF"
-                    ))
-                else:
-                    if self.active_trade.phase == TradePhase.PHASE_1_BOTH_LEGS:
-                        exit_res = self.exit_manager.check_exits(
-                            trade=self.active_trade,
-                            ce_price=ce_p,
-                            pe_price=pe_p,
-                            iv_percentile=50.0,
-                            is_preclose=is_preclose,
-                            config=self.config
-                        )
-                        if exit_res:
-                            self.log_activity(f"Exit trigger: {exit_res.value}. Enqueuing exit.")
-                            self.queue.enqueue(ExecutionSignal(
-                                type=SignalType.EXIT_BOTH,
-                                trade_id=self.active_trade.id,
-                                reason=exit_res.value
-                            ))
-                        else:
-                            if self.active_trade.regime_at_entry == MarketRegime.DIRECTIONAL:
-                                if self.hedge_cut_manager.should_hedge_cut(self.active_trade, ce_p, pe_p, self.config):
-                                    self.log_activity("Losing leg breach. Enqueuing hedge cut.")
-                                    self.queue.enqueue(ExecutionSignal(
-                                        type=SignalType.HEDGE_CUT,
-                                        trade_id=self.active_trade.id
-                                    ))
-                                elif features_ready:
-                                    self._check_rotation_live(regime, ce_p, pe_p)
-                            elif features_ready:
-                                self._check_rotation_live(regime, ce_p, pe_p)
-                                
-                    elif self.active_trade.phase == TradePhase.PHASE_2_SINGLE_LEG:
-                        exit_res = self.single_leg_exit_manager.check_single_leg_exit(
-                            trade=self.active_trade,
-                            ce_price=ce_p,
-                            pe_price=pe_p,
-                            config=self.config
-                        )
-                        if exit_res:
-                            self.log_activity(f"Single leg trailing exit: {exit_res.value}. Enqueuing exit.")
-                            self.queue.enqueue(ExecutionSignal(
-                                type=SignalType.EXIT_BOTH,
-                                trade_id=self.active_trade.id,
-                                reason=exit_res.value
-                            ))
-                        else:
-                            if features_ready and regime == MarketRegime.SIDEWAYS:
-                                self._check_rotation_live(regime, ce_p, pe_p)
-                    elif self.active_trade.phase == TradePhase.PARTIAL_EXIT:
-                        self.log_activity("Partial broker exit detected. Retrying only recorded open units.")
-                        self.queue.enqueue(ExecutionSignal(
-                            type=SignalType.EXIT_BOTH,
-                            trade_id=self.active_trade.id,
-                            reason=(self.active_trade.exit_reason or ExitReason.PARTIAL_FILL_ABORT).value,
-                        ))
-        else:
-            # Reconcile open positions with broker to catch orphan positions in LIVE mode
-            if self.config.execution_mode == ExecutionMode.LIVE.value:
-                try:
-                    positions = self.broker_executor.client.get_positions()
-                    active_positions = [p for p in positions if int(p.get("netQty", 0)) != 0]
-                    if active_positions:
-                        self.log_activity(
-                            f"RECONCILIATION BLOCK: Broker has {len(active_positions)} untracked open positions. "
-                            "Automatic liquidation is disabled because they may be manual/unrelated positions. "
-                            "New strategy entries are blocked pending manual reconciliation."
-                        )
-                        return
-                except Exception as recon_err:
-                    logger.error(f"Broker position reconciliation check failed: {recon_err}")
-
-            if self.index_selection is not None:
-                selection_snapshot = self.index_selection.snapshot()
-                if selection_snapshot.pause_new_entries:
-                    self.log_activity(
-                        "Pause New Entries is active. Existing-position monitoring remains enabled."
-                    )
-                    return
-                if "NIFTY" not in selection_snapshot.symbols:
-                    self.log_activity(
-                        "NIFTY is not selected. The NIFTY entry adapter is paused."
-                    )
-                    return
-
-            # Check entry conditions. Incomplete candles are display-only and
-            # can never drive a new entry.
-            if not features_ready:
-                self.log_activity(
-                    f"Entry scan waiting for 10 completed one-minute spot candles; "
-                    f"currently {len(spot_candles)}. Active-position exits remain enabled."
-                )
-                return
-            if not trading_hours:
-                self.log_activity(f"Outside trading hours (09:30-15:20). Current: {now.strftime('%H:%M:%S')}")
-                return
-            if last_entry_passed:
-                self.log_activity(f"Last entry time passed. Entries disabled.")
-                return
-            if breaker_hit and self.config.execution_mode != ExecutionMode.PAPER.value:
-                self.log_activity("Daily Circuit Breaker is active. Entries blocked.")
-                return
-            if (
-                self._last_entry_scan_at is not None
-                and (now - self._last_entry_scan_at).total_seconds()
-                < self.config.scan_interval_seconds
-            ):
-                return
-            self._last_entry_scan_at = now
-            latest_spot_candle = spot_candles[-1]
-            if latest_spot_candle.timestamp == self._last_entry_candle_at:
-                return
-            self._last_entry_candle_at = latest_spot_candle.timestamp
-
-            if breaker_hit:
-                self.log_activity(
-                    "PAPER daily loss threshold is active. Testing continues; "
-                    "new trades will be tagged -SL."
-                )
-
+        if ready:
+            summary = ", ".join(
+                f"{state.symbol}={state.regime.value}/{state.spot_trend}"
+                for state in ready
+            )
             next_scan = now + timedelta(seconds=self.config.scan_interval_seconds)
             self.log_activity(
-                f"Scanning market. Spot: {spot_price:.2f} | ATM Strike: {atm_strike} | "
-                f"Regime: {regime.value} ({spot_trend}) | "
-                f"Next entry scan no earlier than {next_scan.strftime('%H:%M:%S')}."
+                f"Multi-index scan complete: {summary}. Outcome: {cycle.outcome.reason}. "
+                f"Next scan no earlier than {next_scan.strftime('%H:%M:%S')}."
             )
-            healthy, health_msg = self.health_monitor.check_health(self.config)
-            if not healthy:
-                self.log_activity(f"Health check failed: {health_msg}. Skipping scan.")
-                return
-
-            candidates = self.generator.generate_candidates()
-            if not candidates:
-                self.log_activity("No candidates generated (empty option chain).")
-                return
-            # De-duplicate strikes before running liquidity filter (CPU and matrix sizing optimization)
-            ce_strikes = list(set(c[0] for c in candidates))
-            pe_strikes = list(set(c[1] for c in candidates))
-            
-            filtered_ce = self.liq_filter.filter_strikes(ce_strikes, "CE", self.config)
-            filtered_pe = self.liq_filter.filter_strikes(pe_strikes, "PE", self.config)
-            
-            filtered_candidates = []
-            for ce in filtered_ce:
-                for pe in filtered_pe:
-                    filtered_candidates.append((ce, pe))
-            
-            self.log_activity(f"Liquidity Filter: {len(filtered_candidates)} of {len(candidates)} pairs passed pre-Cartesian check.")
-            if not filtered_candidates:
-                return
-                
-            scanned = self.scanner.scan_candidates(filtered_candidates)
-            survivors = self.entry_signal.evaluate_signals(
-                scanned, regime, spot_trend, self.config, spot_price=spot_price
+        elif cycle.outcome.reason == "PAUSE_NEW_ENTRIES":
+            self.log_activity(
+                "Pause New Entries is active. Existing-position monitoring remains enabled."
             )
-            self.log_activity(f"Divergence check: {len(survivors)} of {len(scanned)} pairs passed entry criteria.")
-            
-            top_candidate = self.ranker.rank_candidates(survivors, self.config)
-            if self.diagnostic_capture is not None:
-                capture_snapshot = self.diagnostic_capture.snapshot()
-                if capture_snapshot.capturing:
-                    diagnostic_rows = build_scan_diagnostics(
-                        scanned=scanned,
-                        survivors=survivors,
-                        ranker_decisions=self.ranker.last_decisions,
-                        regime=regime,
-                        spot_trend=spot_trend,
-                        config=self.config,
-                        index_symbol="NIFTY",
-                        spot_price=spot_price,
-                    )
-                    self.diagnostic_capture.record(
-                        diagnostic_rows[: capture_snapshot.top_count]
-                    )
-            
-            if top_candidate:
-                self.log_activity(f"Top Candidate selected: {top_candidate.ce_strike}CE-{top_candidate.pe_strike}PE (Divergence: {top_candidate.divergence:.2f}%)")
-                ce_data = market_cache.get_option(top_candidate.ce_strike, "CE")
-                pe_data = market_cache.get_option(top_candidate.pe_strike, "PE")
-                if ce_data and pe_data:
-                    ce_entry_price = ce_data.get("ask", ce_data["last"])
-                    pe_entry_price = pe_data.get("ask", pe_data["last"])
-                    qty = self.sizer.calculate_lots(
-                        ce_entry_price,
-                        pe_entry_price,
-                        self.config,
-                        available_capital=self.current_strategy_equity(),
-                    )
-                    if qty > 0:
-                        plan = self.planner.plan_trade(
-                            candidate=top_candidate,
-                            regime=regime,
-                            quantity=qty,
-                            ce_price=ce_entry_price,
-                            pe_price=pe_entry_price,
-                            config=self.config
-                        )
-                        plan.post_daily_sl = (
-                            self.config.execution_mode == ExecutionMode.PAPER.value
-                            and breaker_hit
-                        )
-                        plan.risk_capital_at_entry = self.current_strategy_equity()
-                        plan.hard_stop_loss = self.config.per_trade_loss_limit(plan.risk_capital_at_entry)
-                        is_valid, reason = self.validator.validate_entry(
-                            plan=plan,
-                            realized_pnl=self.realized_pnl,
-                            active_trade=self.active_trade,
-                            config=self.config
-                        )
-                        if is_valid:
-                            self.log_activity(f"Validation successful. Enqueuing entry signal for {qty} lots.")
-                            self.queue.enqueue(ExecutionSignal(
-                                type=SignalType.ENTRY,
-                                trade_plan=plan
-                            ))
-                        else:
-                            self.log_activity(f"Entry validation failed: {reason}")
-                    else:
-                        required_prem = (ce_entry_price + pe_entry_price) * self.config.nifty_lot_size
-                        self.log_activity(f"Sizer returned 0 lots (Required: ₹{required_prem:.2f}, Capital: ₹{self.config.total_capital:.2f})")
-            else:
-                self.log_activity("No scanned pairs met entry signals.")
 
-    def _check_rotation_live(self, regime: MarketRegime, ce_p: float, pe_p: float) -> None:
-        from data.market_cache import market_cache
+    def _monitor_active_position(
+        self,
+        *,
+        now: datetime,
+        current_time: datetime_time,
+        end_time: datetime_time,
+        is_preclose: bool,
+        breaker_hit: bool,
+    ) -> None:
+        trade = self.active_trade
+        symbol = str(getattr(trade, "index_symbol", "NIFTY")).upper()
+        cache = self._cache_for_trade(trade)
+        ce_data = cache.get_option(trade.strike_ce, "CE")
+        pe_data = cache.get_option(trade.strike_pe, "PE")
+        if not ce_data or not pe_data:
+            self._log_activity_throttled(
+                f"active-quotes:{symbol}",
+                f"Active {symbol} position quotes are unavailable; new entries remain blocked.",
+                10,
+                now,
+            )
+            return
 
-        candidates = self.generator.generate_candidates()
+        ce_price = ce_data.get("bid", ce_data["last"])
+        pe_price = pe_data.get("bid", pe_data["last"])
+        trade.ce_current_price = ce_price
+        trade.pe_current_price = pe_price
+        self.store.save_trade(trade)
+        self.recovery.save_state(
+            self.realized_pnl, trade, execution_mode=self.session_execution_mode
+        )
+        self._log_activity_throttled(
+            f"active-position:{trade.id}",
+            f"Active {symbol} position: {display_trade_id(trade)} ({trade.phase.value}); "
+            f"combined PnL â‚¹{trade.combined_pnl:.2f}.",
+            10,
+            now,
+        )
+
+        if breaker_hit and self.config.execution_mode != ExecutionMode.PAPER.value:
+            self.queue.enqueue(ExecutionSignal(
+                type=SignalType.EXIT_BOTH,
+                trade_id=trade.id,
+                reason=ExitReason.CIRCUIT_BREAKER_TRIGGERED.value,
+            ))
+            return
+        if current_time >= end_time:
+            self.queue.enqueue(ExecutionSignal(
+                type=SignalType.EXIT_BOTH,
+                trade_id=trade.id,
+                reason=ExitReason.EOD_SQUARE_OFF.value,
+            ))
+            return
+
+        state = self.multi_index_runtime.market_state(symbol)
+        regime = state.regime if state.ready else trade.regime_at_entry
+        if trade.phase == TradePhase.PHASE_1_BOTH_LEGS:
+            exit_reason = self.exit_manager.check_exits(
+                trade=trade,
+                ce_price=ce_price,
+                pe_price=pe_price,
+                iv_percentile=50.0,
+                is_preclose=is_preclose,
+                config=self.config,
+            )
+            if exit_reason:
+                self.queue.enqueue(ExecutionSignal(
+                    type=SignalType.EXIT_BOTH,
+                    trade_id=trade.id,
+                    reason=exit_reason.value,
+                ))
+            elif trade.regime_at_entry == MarketRegime.DIRECTIONAL and self.hedge_cut_manager.should_hedge_cut(
+                trade, ce_price, pe_price, self.config
+            ):
+                self.queue.enqueue(ExecutionSignal(
+                    type=SignalType.HEDGE_CUT, trade_id=trade.id
+                ))
+            elif state.ready:
+                self._check_rotation_live(regime, ce_price, pe_price, symbol)
+        elif trade.phase == TradePhase.PHASE_2_SINGLE_LEG:
+            exit_reason = self.single_leg_exit_manager.check_single_leg_exit(
+                trade=trade,
+                ce_price=ce_price,
+                pe_price=pe_price,
+                config=self.config,
+            )
+            if exit_reason:
+                self.queue.enqueue(ExecutionSignal(
+                    type=SignalType.EXIT_BOTH,
+                    trade_id=trade.id,
+                    reason=exit_reason.value,
+                ))
+            elif state.ready and regime == MarketRegime.SIDEWAYS:
+                self._check_rotation_live(regime, ce_price, pe_price, symbol)
+        elif trade.phase == TradePhase.PARTIAL_EXIT:
+            self.queue.enqueue(ExecutionSignal(
+                type=SignalType.EXIT_BOTH,
+                trade_id=trade.id,
+                reason=(trade.exit_reason or ExitReason.PARTIAL_FILL_ABORT).value,
+            ))
+
+    def _check_rotation_live(
+        self,
+        regime: MarketRegime,
+        ce_p: float,
+        pe_p: float,
+        index_symbol: str = "NIFTY",
+    ) -> None:
+        symbol = str(index_symbol).upper()
+        context = self.multi_index_runtime.scanners[symbol]
+        cache = self.market_caches.get(symbol)
+        candidates = context.generator.generate_candidates(regime, date.today())
         ce_strikes = [c[0] for c in candidates]
         pe_strikes = [c[1] for c in candidates]
-        
-        filtered_ce = self.liq_filter.filter_strikes(ce_strikes, "CE", self.config)
-        filtered_pe = self.liq_filter.filter_strikes(pe_strikes, "PE", self.config)
-        
-        filtered_candidates = []
-        for ce in filtered_ce:
-            for pe in filtered_pe:
-                filtered_candidates.append((ce, pe))
-                
-        scanned = self.scanner.scan_candidates(filtered_candidates)
-        spot_price, _ = market_cache.get_spot()
-        survivors = self.entry_signal.evaluate_signals(
+
+        filtered_ce = set(context.liquidity.filter_strikes(ce_strikes, "CE", self.config))
+        filtered_pe = set(context.liquidity.filter_strikes(pe_strikes, "PE", self.config))
+        filtered_candidates = [
+            pair for pair in candidates
+            if pair[0] in filtered_ce and pair[1] in filtered_pe
+        ]
+        scanned = context.divergence.scan_candidates(filtered_candidates)
+        spot_price, _ = cache.get_spot()
+        survivors = context.entry_signal.evaluate_signals(
             scanned, regime, "SIDEWAYS", self.config, spot_price=spot_price
         )
-        top_candidate = self.ranker.rank_candidates(survivors, self.config)
+        top_candidate = context.ranker.rank_candidates(
+            survivors,
+            self.config,
+            lot_size=self.index_registry.get(symbol).lot_size,
+            available_capital=self.current_strategy_equity(),
+        )
 
         if top_candidate:
             now = datetime.now()
@@ -720,13 +717,23 @@ class LiveEngine:
                 config=self.config
             )
             if should:
-                plan = self.planner.plan_trade(
+                ce_quote = cache.get_option(top_candidate.ce_strike, "CE")
+                pe_quote = cache.get_option(top_candidate.pe_strike, "PE")
+                if not ce_quote or not pe_quote:
+                    self.log_activity("ROTATION BLOCKED: selected replacement quotes are unavailable.")
+                    return
+                spec = self.index_registry.get(symbol)
+                plan = context.planner.plan_trade(
                     candidate=top_candidate,
                     regime=regime,
                     quantity=self.active_trade.quantity,
-                    ce_price=ce_p,
-                    pe_price=pe_p,
-                    config=self.config
+                    ce_price=ce_quote.get("ask", ce_p),
+                    pe_price=pe_quote.get("ask", pe_p),
+                    config=self.config,
+                    ce_bid=ce_quote.get("bid"),
+                    pe_bid=pe_quote.get("bid"),
+                    lot_size=spec.lot_size,
+                    index_symbol=symbol,
                 )
                 self.queue.enqueue(ExecutionSignal(
                     type=SignalType.ROTATION,
@@ -750,20 +757,20 @@ class LiveEngine:
                     -abs(self.config.daily_loss_limit),
                 )
                 self.log_activity("LIVE ENTRY BLOCKED: daily loss stop is latched for today.")
+                self._release_reservation(signal.reservation_token)
                 return
             if self.active_trade is not None and self.active_trade.is_open:
                 self.log_activity(
                     f"ENTRY BLOCKED AT EXECUTION: Trade {display_trade_id(self.active_trade)} is already active."
                 )
+                self._release_reservation(signal.reservation_token)
                 return
             plan = signal.trade_plan
             plan.risk_capital_at_entry = self.current_strategy_equity()
             plan.hard_stop_loss = self.config.per_trade_loss_limit(plan.risk_capital_at_entry)
-            plan.post_daily_sl = (
+            plan.post_daily_sl = bool(
                 execution_mode == ExecutionMode.PAPER.value
-                and self.circuit_breaker.is_breaker_triggered(
-                    self.realized_pnl, self.config
-                )
+                and (plan.post_daily_sl or self._paper_daily_threshold_active)
             )
             self.log_activity(f"Executing ENTRY order for {plan.scored_candidate.ce_strike}CE / {plan.scored_candidate.pe_strike}PE ({plan.quantity} lots)...")
             if is_live:
@@ -771,9 +778,12 @@ class LiveEngine:
                 trade = loop.run_until_complete(self.broker_executor.execute_entry(plan, now))
                 loop.close()
             else:
-                trade = self.paper_executor.execute_entry(plan, now)
+                trade = self._execute_paper_plan(
+                    plan, now, signal.reservation_token
+                )
 
             self.active_trade = trade
+            self._position_reservation_token = signal.reservation_token
             self.store.save_trade(trade)
             self.recovery.save_state(
                 self.realized_pnl, trade, execution_mode=execution_mode
@@ -802,10 +812,11 @@ class LiveEngine:
                         loop.run_until_complete(self.broker_executor.execute_exit_both(self.active_trade, now, reason))
                     loop.close()
                 else:
+                    executor = self._paper_executor_for_trade(self.active_trade)
                     if self.active_trade.phase == TradePhase.PHASE_2_SINGLE_LEG:
-                        self.paper_executor.execute_single_leg_exit(self.active_trade, now, reason)
+                        executor.execute_single_leg_exit(self.active_trade, now, reason)
                     else:
-                        self.paper_executor.execute_exit_both(self.active_trade, now, reason)
+                        executor.execute_exit_both(self.active_trade, now, reason)
 
                 self.realized_pnl = round(self.realized_pnl + self.active_trade.net_pnl, 2)
                 self.capital_ledger.record_trade_pnl(
@@ -829,7 +840,9 @@ class LiveEngine:
                     loop.run_until_complete(self.broker_executor.execute_hedge_cut(self.active_trade, now))
                     loop.close()
                 else:
-                    self.paper_executor.execute_hedge_cut(self.active_trade, now)
+                    self._paper_executor_for_trade(self.active_trade).execute_hedge_cut(
+                        self.active_trade, now
+                    )
 
                 self.store.save_trade(self.active_trade)
                 self.recovery.save_state(
@@ -857,10 +870,11 @@ class LiveEngine:
                         loop.run_until_complete(self.broker_executor.execute_exit_both(self.active_trade, now, ExitReason.ROTATION))
                     loop.close()
                 else:
+                    executor = self._paper_executor_for_trade(self.active_trade)
                     if self.active_trade.phase == TradePhase.PHASE_2_SINGLE_LEG:
-                        self.paper_executor.execute_single_leg_exit(self.active_trade, now, ExitReason.ROTATION)
+                        executor.execute_single_leg_exit(self.active_trade, now, ExitReason.ROTATION)
                     else:
-                        self.paper_executor.execute_exit_both(self.active_trade, now, ExitReason.ROTATION)
+                        executor.execute_exit_both(self.active_trade, now, ExitReason.ROTATION)
 
                 self.realized_pnl = round(self.realized_pnl + self.active_trade.net_pnl, 2)
                 self.capital_ledger.record_trade_pnl(
@@ -890,6 +904,7 @@ class LiveEngine:
                     self.log_activity(
                         "LIVE ENTRY BLOCKED: daily loss stop is latched for today after rotation close."
                     )
+                    self._release_reservation()
                     return
 
                 # Enter new
@@ -908,7 +923,9 @@ class LiveEngine:
                     trade = loop.run_until_complete(self.broker_executor.execute_entry(plan, now))
                     loop.close()
                 else:
-                    trade = self.paper_executor.execute_entry(plan, now)
+                    trade = self._execute_paper_plan(
+                        plan, now, self._position_reservation_token
+                    )
 
                 self.active_trade = trade
                 self.store.save_trade(trade)
@@ -1014,9 +1031,9 @@ def main():
                         loop.close()
                     else:
                         if engine_inst.active_trade.phase == TradePhase.PHASE_2_SINGLE_LEG:
-                            engine_inst.paper_executor.execute_single_leg_exit(engine_inst.active_trade, now, ExitReason.MANUAL)
+                            engine_inst._paper_executor_for_trade(engine_inst.active_trade).execute_single_leg_exit(engine_inst.active_trade, now, ExitReason.MANUAL)
                         else:
-                            engine_inst.paper_executor.execute_exit_both(engine_inst.active_trade, now, ExitReason.MANUAL)
+                            engine_inst._paper_executor_for_trade(engine_inst.active_trade).execute_exit_both(engine_inst.active_trade, now, ExitReason.MANUAL)
                 except Exception as square_err:
                     st.sidebar.error(f"Emergency square-off failed: {square_err}")
                     st.stop()
@@ -1034,13 +1051,13 @@ def main():
                     engine_inst.active_trade.net_pnl,
                 )
             engine_inst.active_trade = None
+            engine_inst._release_reservation()
             engine_inst.recovery.save_state(
                 engine_inst.realized_pnl,
                 None,
                 execution_mode=exec_mode,
             )
-            from data.market_cache import market_cache
-            market_cache.clear()
+            engine_inst.market_caches.clear()
             st.toast("Active position, recovery state, and Cache wiped cleanly.", icon="🧹")
             st.rerun()
     else:

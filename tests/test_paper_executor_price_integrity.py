@@ -96,6 +96,18 @@ def test_dynamic_quantity_is_shared_by_both_paper_legs():
     assert trade.units_per_leg == 11_635
 
 
+def test_paper_entry_preserves_index_identity_and_lot_size_from_plan():
+    _populate_quotes()
+    plan = _plan()
+    plan.index_symbol = "BANKNIFTY"
+    plan.lot_size = 30
+
+    trade = PaperExecutor().execute_entry(plan, datetime.now())
+
+    assert trade.index_symbol == "BANKNIFTY"
+    assert trade.lot_size == 30
+
+
 def test_limit_entry_receives_ask_price_improvement_when_marketable():
     _populate_quotes()
 
@@ -116,7 +128,7 @@ def test_limit_entry_fails_atomically_when_either_ask_exceeds_limit():
     _populate_quotes()
 
     with pytest.raises(PartialFillError, match="CE buy limit"):
-        PaperExecutor().execute_entry(
+        PaperExecutor(limit_fill_timeout_seconds=0.0).execute_entry(
             _plan(
                 order_type=OrderType.LIMIT,
                 ce_limit_price=100.0,
@@ -124,6 +136,77 @@ def test_limit_entry_fails_atomically_when_either_ask_exceeds_limit():
             ),
             datetime.now(),
         )
+
+
+def test_limit_entry_waits_for_both_legs_to_cross_in_one_snapshot():
+    clock = [0.0]
+    snapshots = [
+        {
+            24300: {
+                "CE": _quote(99.0, 101.0, 100.0),
+                "PE": _quote(198.0, 202.0, 200.0),
+            }
+        },
+        {
+            24300: {
+                "CE": _quote(99.0, 100.0, 99.5),
+                "PE": _quote(198.0, 202.0, 200.0),
+            }
+        },
+    ]
+
+    def chain_provider():
+        return snapshots.pop(0) if len(snapshots) > 1 else snapshots[0]
+
+    executor = PaperExecutor(
+        chain_provider=chain_provider,
+        limit_fill_timeout_seconds=2.0,
+        limit_fill_poll_seconds=1.0,
+        monotonic=lambda: clock[0],
+        sleep=lambda seconds: clock.__setitem__(0, clock[0] + seconds),
+    )
+
+    trade = executor.execute_entry(
+        _plan(
+            order_type=OrderType.LIMIT,
+            ce_limit_price=100.0,
+            pe_limit_price=202.0,
+        ),
+        datetime.now(),
+    )
+
+    assert trade.entry_ce_price == 100.0
+    assert trade.entry_pe_price == 202.0
+    assert clock[0] == 1.0
+
+
+def test_limit_entry_times_out_without_creating_a_partial_trade():
+    clock = [0.0]
+    snapshot = {
+        24300: {
+            "CE": _quote(99.0, 101.0, 100.0),
+            "PE": _quote(198.0, 202.0, 200.0),
+        }
+    }
+    executor = PaperExecutor(
+        chain_provider=lambda: snapshot,
+        limit_fill_timeout_seconds=2.0,
+        limit_fill_poll_seconds=1.0,
+        monotonic=lambda: clock[0],
+        sleep=lambda seconds: clock.__setitem__(0, clock[0] + seconds),
+    )
+
+    with pytest.raises(PartialFillError, match="timed out"):
+        executor.execute_entry(
+            _plan(
+                order_type=OrderType.LIMIT,
+                ce_limit_price=100.0,
+                pe_limit_price=202.0,
+            ),
+            datetime.now(),
+        )
+
+    assert clock[0] == 2.0
 
 
 def test_exit_both_sells_both_legs_at_bid():

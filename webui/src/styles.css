@@ -8,6 +8,14 @@ h1, h2, p { margin-top: 0; } h1 { font-size: clamp(1.8rem, 4vw, 3.2rem); margin-
 .paper-lock, .status, .badge { border-radius: 999px; padding: 7px 11px; font-size: .72rem; font-style: normal; font-weight: 800; }
 .paper-lock { background: #113d37; color: #8ff3de; border: 1px solid #257568; }
 .panel { margin-top: 24px; padding: 22px; background: rgba(15, 29, 49, .88); border: 1px solid #263b58; border-radius: 18px; box-shadow: 0 18px 50px rgba(0,0,0,.18); }
+.workspace-nav { display: flex; gap: 10px; margin-top: 20px; flex-wrap: wrap; }
+.workspace-nav button { background: #0f1d31; color: #a9c9ed; border: 1px solid #314867; border-radius: 10px; padding: 10px 16px; }
+.workspace-nav button.active { background: #0f766e; color: white; border-color: #2dd4bf; }
+.session-banner { display: grid; gap: 5px; padding: 12px 14px; margin: 14px 0; border-radius: 10px; background: #0a2338; border: 1px solid #285376; color: #b9daf4; }
+.session-banner strong { color: #5eead4; font-size: .82rem; letter-spacing: .06em; }
+.safety-list { display: grid; gap: 10px; margin-top: 18px; }
+.safety-list p { margin: 0; padding: 14px; border-left: 3px solid #f59e0b; background: #182337; }
+.danger-status { background: #7f1d1d !important; color: #fecaca !important; }
 .status.active { background: #123c34; color: #76e6ce; } .status.paused { background: #4a3514; color: #ffd384; }
 .index-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-top: 14px; }
 .dashboard-grid { display: grid; grid-template-columns: 1.15fr .85fr; gap: 12px; margin-top: 14px; }

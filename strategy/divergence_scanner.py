@@ -1,6 +1,6 @@
 import logging
 from typing import List, Tuple, Any
-from data.market_cache import market_cache
+from data.market_cache import MarketCache, market_cache
 from core.models import CandidatePair
 from data.candle_store import CompletedCandleStore, completed_candles, option_candle_key
 
@@ -16,13 +16,15 @@ class DivergenceScanner:
         *,
         index_symbol: str = "NIFTY",
         require_completed: bool = False,
+        cache: MarketCache | None = None,
     ) -> None:
         self.candle_store = candle_store or completed_candles
         self.index_symbol = index_symbol
         self.require_completed = require_completed
+        self.cache = cache or market_cache
 
     def scan_candidates(self, candidates: List[Tuple[Any, Any]]) -> List[CandidatePair]:
-        chain = market_cache.get_option_chain()
+        chain = self.cache.get_option_chain()
         pairs = []
 
         for ce_strike, pe_strike in candidates:
@@ -40,8 +42,10 @@ class DivergenceScanner:
                     continue
                 if ce_pair[1].timestamp != pe_pair[1].timestamp:
                     continue
-                ce_open, ce_close = ce_pair[0].close, ce_pair[1].close
-                pe_open, pe_close = pe_pair[0].close, pe_pair[1].close
+                # Compare the latest completed candle's own open and close.
+                # Inter-candle gaps must not inflate the approved velocity.
+                ce_open, ce_close = ce_pair[1].open, ce_pair[1].close
+                pe_open, pe_close = pe_pair[1].open, pe_pair[1].close
             else:
                 if not ce_data or not pe_data:
                     continue

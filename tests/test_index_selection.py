@@ -11,6 +11,14 @@ def test_registry_contains_three_tradable_and_two_observe_only_indices():
     assert registry.get("NIFTY").lot_size == 65
     assert registry.get("BANKNIFTY").lot_size == 30
     assert registry.get("FINNIFTY").lot_size == 60
+    assert registry.get("NIFTY").strike_step == 50
+    assert registry.get("BANKNIFTY").strike_step == 100
+    assert registry.get("FINNIFTY").strike_step == 100
+    assert registry.get("MIDCPNIFTY").strike_step == 25
+    assert registry.get("NIFTYNXT50").strike_step == 100
+    assert registry.get("NIFTY").underlying_security_id == 13
+    assert registry.get("BANKNIFTY").underlying_security_id == 25
+    assert all(registry.get(symbol).runtime_connected for symbol in registry.symbols)
     assert registry.get("MIDCPNIFTY").permission is IndexPermission.OBSERVE_ONLY
     assert registry.get("NIFTYNXT50").permission is IndexPermission.OBSERVE_ONLY
 
@@ -65,9 +73,11 @@ def test_unknown_index_is_rejected_and_changes_are_audited():
 
 def test_web_runtime_receives_authoritative_selection_service():
     runtime_source = __import__("pathlib").Path("application/runtime_service.py").read_text(encoding="utf-8")
-    engine_source = __import__("pathlib").Path("ui/app.py").read_text(encoding="utf-8")
+    multi_index_source = __import__("pathlib").Path(
+        "application/multi_index_runtime.py"
+    ).read_text(encoding="utf-8")
 
     assert "index_selection=selection" in runtime_source
-    assert "self.index_selection.snapshot()" in engine_source
-    assert "selection_snapshot.pause_new_entries" in engine_source
-    assert '"NIFTY" not in selection_snapshot.symbols' in engine_source
+    assert "selected = self.selection.snapshot()" in multi_index_source
+    assert "selected.pause_new_entries" in multi_index_source
+    assert "for symbol in sorted(selected.symbols)" in multi_index_source

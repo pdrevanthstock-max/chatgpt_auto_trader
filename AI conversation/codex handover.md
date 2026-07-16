@@ -1072,3 +1072,13 @@ Completion requires fresh test output plus code/UI review; passing unit tests al
   - numeric strike lists are recalculated from live spot and each index's strike step every feed cycle, never hard-coded in React.
 - User authorized publishing the current work to GitHub. Scope review excluded `docs/superpowers/`, `logs/`, PID/runtime files and visual-companion artifacts; intended scope includes the multi-index/PAPER-safety implementation, tests, UI/service updates, handover and project-scoped read-only UI agent.
 - GitHub CLI 2.96.0 was installed successfully through Winget because it was absent. `gh auth status` then confirmed no authenticated GitHub host. Browser login could not complete through the non-interactive tool session and was terminated without staging, committing or pushing. User must run `gh auth login` in their own PowerShell and confirm completion before publication continues.
+
+### 2026-07-16 — Multi-index runtime published for review
+
+- User completed GitHub browser authentication. Escalated readback confirmed account `pdrevanthstock-max`, repository `pdrevanthstock-max/chatgpt_auto_trader`, and default branch `main`.
+- Existing branch `codex/capital-live-safety-readiness-docs` had already been merged through PRs #2 and #3. To avoid reopening work from stale branch history, the new verified commit was transplanted onto fresh branch `codex/multi-index-atm-itm-runtime` based directly on current `origin/main`.
+- Scoped commit after rebase: `c0c2c00 Add multi-index PAPER runtime and ATM-ITM scanning` (67 files). `docs/superpowers/`, `logs/`, PID/runtime files and visual-companion artifacts remained excluded.
+- Post-rebase verification on the exact published commit: backend 183 passed with the one known Starlette/httpx deprecation warning; frontend 9 passed; TypeScript/Vite production build succeeded; diff check passed; broker executor remained unchanged; PAPER mode/LIVE-disabled settings and backtest dates 2026-06-09 through 2026-07-13 were preserved.
+- Branch push succeeded to `origin/codex/multi-index-atm-itm-runtime` with upstream tracking.
+- GitHub App PR creation lacked repository integration permission (`403`), so the authenticated GitHub CLI fallback created draft PR #4: `https://github.com/pdrevanthstock-max/chatgpt_auto_trader/pull/4`.
+- PR description explicitly states that the newly approved Pair Inspector redesign is a follow-up and is not falsely represented as implemented in this publication.

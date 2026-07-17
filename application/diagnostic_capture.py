@@ -13,6 +13,7 @@ class DiagnosticSnapshot:
     capturing: bool
     top_count: int
     rows: tuple[dict[str, object], ...]
+    full_rows: tuple[dict[str, object], ...] = ()
 
 
 class DiagnosticCaptureService:
@@ -24,7 +25,8 @@ class DiagnosticCaptureService:
         self._max_rows = max_rows
         self._capturing = False
         self._top_count = 5
-        self._rows: list[dict[str, object]] = []
+        self._rows_by_index: dict[str, list[dict[str, object]]] = {}
+        self._sequence = 0
         self._lock = RLock()
 
     def start(self, top_count: int) -> DiagnosticSnapshot:
@@ -33,7 +35,8 @@ class DiagnosticCaptureService:
         with self._lock:
             self._capturing = True
             self._top_count = top_count
-            self._rows = []
+            self._rows_by_index = {}
+            self._sequence = 0
             return self._snapshot_unlocked()
 
     def stop(self) -> DiagnosticSnapshot:
@@ -45,15 +48,71 @@ class DiagnosticCaptureService:
         with self._lock:
             if not self._capturing:
                 return
-            self._rows.extend(dict(row) for row in rows)
-            if len(self._rows) > self._max_rows:
-                self._rows = self._rows[-self._max_rows :]
+            for source in rows:
+                row = dict(source)
+                index_symbol = str(
+                    row.get("index", row.get("symbol", "__UNKNOWN__"))
+                ).upper()
+                row["__capture_sequence"] = self._sequence
+                self._sequence += 1
+                history = self._rows_by_index.setdefault(index_symbol, [])
+                history.append(row)
+                if len(history) > self._max_rows:
+                    del history[: len(history) - self._max_rows]
+
+    @staticmethod
+    def _public_row(row: Mapping[str, object]) -> dict[str, object]:
+        return {key: value for key, value in row.items() if key != "__capture_sequence"}
+
+    def _full_rows_unlocked(self) -> list[dict[str, object]]:
+        rows = [row for history in self._rows_by_index.values() for row in history]
+        rows.sort(key=lambda row: int(row["__capture_sequence"]))
+        return rows
+
+    def _visible_rows_unlocked(self, full_rows: list[dict[str, object]]) -> list[dict[str, object]]:
+        groups: dict[tuple[str, str], list[dict[str, object]]] = {}
+        for row in full_rows:
+            index_symbol = str(
+                row.get("index", row.get("symbol", "__UNKNOWN__"))
+            ).upper()
+            cycle_id = str(row.get("cycle_id", "__LEGACY__"))
+            groups.setdefault((cycle_id, index_symbol), []).append(row)
+
+        latest_cycle_by_index: dict[str, tuple[str, int]] = {}
+        for (cycle_id, index_symbol), group in groups.items():
+            newest_sequence = max(int(row["__capture_sequence"]) for row in group)
+            previous = latest_cycle_by_index.get(index_symbol)
+            if previous is None or newest_sequence > previous[1]:
+                latest_cycle_by_index[index_symbol] = (cycle_id, newest_sequence)
+
+        visible: list[dict[str, object]] = []
+        for index_symbol in sorted(latest_cycle_by_index):
+            cycle_id, _ = latest_cycle_by_index[index_symbol]
+            group = groups[(cycle_id, index_symbol)]
+            ranked_rows = [
+                row for row in group
+                if isinstance(row.get("rank"), (int, float))
+                or str(row.get("rank", "")).isdigit()
+            ]
+            candidates = ranked_rows or group
+            ranked = sorted(
+                candidates,
+                key=lambda row: (
+                    int(row.get("rank", 2**31 - 1)),
+                    int(row["__capture_sequence"]),
+                ),
+            )
+            visible.extend(ranked[: self._top_count])
+        return visible
 
     def _snapshot_unlocked(self) -> DiagnosticSnapshot:
+        full_rows = self._full_rows_unlocked()
+        visible_rows = self._visible_rows_unlocked(full_rows)
         return DiagnosticSnapshot(
             capturing=self._capturing,
             top_count=self._top_count,
-            rows=tuple(dict(row) for row in self._rows),
+            rows=tuple(self._public_row(row) for row in visible_rows),
+            full_rows=tuple(self._public_row(row) for row in full_rows),
         )
 
     def snapshot(self) -> DiagnosticSnapshot:
@@ -61,10 +120,10 @@ class DiagnosticCaptureService:
             return self._snapshot_unlocked()
 
     def to_json(self) -> str:
-        return json.dumps(list(self.snapshot().rows), sort_keys=True, indent=2)
+        return json.dumps(list(self.snapshot().full_rows), sort_keys=True, indent=2)
 
     def to_csv(self) -> str:
-        rows = list(self.snapshot().rows)
+        rows = list(self.snapshot().full_rows)
         fieldnames = sorted({key for row in rows for key in row})
         output = io.StringIO(newline="")
         if fieldnames:

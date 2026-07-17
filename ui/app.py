@@ -169,6 +169,7 @@ class LiveEngine:
         )
         
         self._last_entry_scan_at: Optional[datetime] = None
+        self._last_rotation_scan_at: Optional[datetime] = None
         self._configure_multi_index_runtime()
 
     def _configure_paper_executors(self) -> None:
@@ -195,7 +196,10 @@ class LiveEngine:
             for row in scan.diagnostics
             if isinstance(row, dict)
         ]
-        self.diagnostic_capture.record(rows[: snapshot.top_count])
+        # Capture performs Top-N selection independently for each index/cycle.
+        # Passing only a global prefix caused BANKNIFTY (alphabetically first)
+        # to hide every other selected index.
+        self.diagnostic_capture.record(rows)
 
     def _configure_multi_index_runtime(self) -> None:
         self.multi_index_runtime = MultiIndexRuntime(
@@ -359,6 +363,7 @@ class LiveEngine:
         with self._log_lock:
             self.activity_log.clear()
         self._last_entry_scan_at = None
+        self._last_rotation_scan_at = None
         self._activity_throttle.clear()
             
         self.log_activity("Clearing stale market cache data...")
@@ -681,65 +686,50 @@ class LiveEngine:
         ce_p: float,
         pe_p: float,
         index_symbol: str = "NIFTY",
+        *,
+        now: Optional[datetime] = None,
     ) -> None:
-        symbol = str(index_symbol).upper()
-        context = self.multi_index_runtime.scanners[symbol]
-        cache = self.market_caches.get(symbol)
-        candidates = context.generator.generate_candidates(regime, date.today())
-        ce_strikes = [c[0] for c in candidates]
-        pe_strikes = [c[1] for c in candidates]
+        del ce_p, pe_p  # Replacement plans use their own index-specific quotes.
+        if (self.session_execution_mode or self.config.execution_mode) != ExecutionMode.PAPER.value:
+            return
+        observed_at = now or datetime.now()
+        if (
+            self._last_rotation_scan_at is not None
+            and (observed_at - self._last_rotation_scan_at).total_seconds()
+            < self.config.scan_interval_seconds
+        ):
+            return
+        self._last_rotation_scan_at = observed_at
 
-        filtered_ce = set(context.liquidity.filter_strikes(ce_strikes, "CE", self.config))
-        filtered_pe = set(context.liquidity.filter_strikes(pe_strikes, "PE", self.config))
-        filtered_candidates = [
-            pair for pair in candidates
-            if pair[0] in filtered_ce and pair[1] in filtered_pe
-        ]
-        scanned = context.divergence.scan_candidates(filtered_candidates)
-        spot_price, _ = cache.get_spot()
-        survivors = context.entry_signal.evaluate_signals(
-            scanned, regime, "SIDEWAYS", self.config, spot_price=spot_price
-        )
-        top_candidate = context.ranker.rank_candidates(
-            survivors,
-            self.config,
-            lot_size=self.index_registry.get(symbol).lot_size,
+        cycle = self.multi_index_runtime.scan_for_rotation(
+            now=observed_at,
+            realized_pnl=self.realized_pnl,
             available_capital=self.current_strategy_equity(),
         )
+        winner = cycle.winner
+        if winner is None or winner.candidate is None or self.active_trade is None:
+            return
 
-        if top_candidate:
-            now = datetime.now()
-            should, reason = self.rotation_engine.should_rotate(
-                active_trade=self.active_trade,
-                top_candidate=top_candidate,
-                current_time=now,
-                current_regime=regime,
-                config=self.config
-            )
-            if should:
-                ce_quote = cache.get_option(top_candidate.ce_strike, "CE")
-                pe_quote = cache.get_option(top_candidate.pe_strike, "PE")
-                if not ce_quote or not pe_quote:
-                    self.log_activity("ROTATION BLOCKED: selected replacement quotes are unavailable.")
-                    return
-                spec = self.index_registry.get(symbol)
-                plan = context.planner.plan_trade(
-                    candidate=top_candidate,
-                    regime=regime,
-                    quantity=self.active_trade.quantity,
-                    ce_price=ce_quote.get("ask", ce_p),
-                    pe_price=pe_quote.get("ask", pe_p),
-                    config=self.config,
-                    ce_bid=ce_quote.get("bid"),
-                    pe_bid=pe_quote.get("bid"),
-                    lot_size=spec.lot_size,
-                    index_symbol=symbol,
-                )
-                self.queue.enqueue(ExecutionSignal(
-                    type=SignalType.ROTATION,
-                    trade_plan=plan,
-                    reason=reason
-                ))
+        active_symbol = str(getattr(self.active_trade, "index_symbol", index_symbol)).upper()
+        opportunity = winner.candidate
+        should, reason = self.rotation_engine.should_rotate(
+            active_trade=self.active_trade,
+            top_candidate=opportunity.scored_candidate,
+            current_time=observed_at,
+            current_regime=regime,
+            config=self.config,
+            cache=self.market_caches.get(active_symbol),
+            lot_size=self.index_registry.get(active_symbol).lot_size,
+        )
+        if should:
+            self.queue.enqueue(ExecutionSignal(
+                type=SignalType.ROTATION,
+                trade_plan=opportunity.plan,
+                reason=(
+                    f"{reason}; global replacement {active_symbol} -> "
+                    f"{winner.index_symbol}"
+                ),
+            ))
 
     def _execute_signal(self, signal: ExecutionSignal) -> None:
         now = datetime.now()
@@ -831,6 +821,7 @@ class LiveEngine:
                 self.decision_memory.log_exit(self.active_trade.id, self.active_trade, reason.value)
                 self.log_activity(f"EXIT SUCCESS: Position closed. Combined PnL: ₹{self.active_trade.combined_pnl:.2f}. Total Session PnL: ₹{self.realized_pnl:.2f}")
                 self.active_trade = None
+                self._release_reservation()
 
         elif signal.type == SignalType.HEDGE_CUT:
             if self.active_trade and self.active_trade.phase == TradePhase.PHASE_1_BOTH_LEGS:

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 
 from application.multi_index_coordinator import IndexScanResult
-from application.scan_diagnostics import build_scan_diagnostics
+from application.capital_affordability import build_capital_affordability
+from application.scan_diagnostics import ScanFunnel, build_scan_diagnostics
 from config.settings import TradingConfig
 from core.enums import MarketRegime
 from core.index_registry import IndexSpec
@@ -79,10 +80,52 @@ class IndexScanner:
         active_trade: Trade | None,
         available_capital: float,
         trading_day: date,
+        cycle_id: str | None = None,
     ) -> IndexScanResult:
-        pairs = self.generator.generate_candidates(regime, trading_day)
+        pairs = self.generator.generate_candidates(
+            regime,
+            trading_day,
+            config=self.config,
+        )
         if not pairs:
             return IndexScanResult(self.spec.symbol, None, ())
+
+        spot, _ = self.cache.get_spot()
+        atm_strike = self.cache.get_atm_strike() if spot else None
+
+        def strike_universe(
+            option_type: str,
+            *,
+            established: bool,
+        ) -> list[dict[str, object]]:
+            if not atm_strike:
+                return []
+            position = 0 if option_type == "CE" else 1
+            strikes = sorted(
+                {int(pair[position]) for pair in pairs},
+                key=lambda strike: (abs(strike - atm_strike), strike),
+            )
+            result: list[dict[str, object]] = []
+            for strike in strikes:
+                signed_steps = (
+                    (atm_strike - strike) // self.spec.strike_step
+                    if option_type == "CE"
+                    else (strike - atm_strike) // self.spec.strike_step
+                )
+                is_established = signed_steps >= 0
+                if is_established != established:
+                    continue
+                distance = abs(int(signed_steps))
+                label = "ATM" if distance == 0 else f"{'ITM' if established else 'OTM'}{distance}"
+                result.append({"strike": strike, "moneyness": label})
+            return result
+
+        universe_fields = {
+            "ce_universe": strike_universe("CE", established=True),
+            "pe_universe": strike_universe("PE", established=True),
+            "research_ce_universe": strike_universe("CE", established=False),
+            "research_pe_universe": strike_universe("PE", established=False),
+        }
 
         ce_allowed = set(self.liquidity.filter_strikes(
             list(dict.fromkeys(ce for ce, _ in pairs)), "CE", self.config
@@ -95,19 +138,20 @@ class IndexScanner:
             if pair[0] in ce_allowed and pair[1] in pe_allowed
         ]
         scanned = self.divergence.scan_candidates(executable_pairs)
-        spot, _ = self.cache.get_spot()
         survivors = self.entry_signal.evaluate_signals(
             scanned,
             regime,
             spot_trend,
             self.config,
             spot_price=spot,
+            strike_step=self.spec.strike_step,
         )
         top = self.ranker.rank_candidates(
             survivors,
             self.config,
             lot_size=self.spec.lot_size,
             available_capital=available_capital,
+            regime=regime,
         )
         diagnostics = build_scan_diagnostics(
             scanned=scanned,
@@ -118,7 +162,53 @@ class IndexScanner:
             config=self.config,
             index_symbol=self.spec.symbol,
             spot_price=spot,
+            atm_strike=atm_strike,
+            strike_step=self.spec.strike_step,
+            cycle_id=cycle_id,
+            funnel=ScanFunnel(
+                generated_count=len(pairs),
+                quotable_count=len(executable_pairs),
+                signal_count=len(survivors),
+                economic_count=sum(
+                    1
+                    for decision in self.ranker.last_decisions.values()
+                    if str(decision.get("result", "")).upper() == "PASS"
+                ),
+                final_count=1 if top is not None else 0,
+                prefilter_rejection_reasons={
+                    "LIQUIDITY_OR_QUOTE_PREFILTER": len(pairs) - len(executable_pairs)
+                } if len(executable_pairs) < len(pairs) else {},
+            ),
         )
+        for row in diagnostics:
+            row.update(universe_fields)
+            ce_quote = self.cache.get_option(row["ce_strike"], "CE")
+            pe_quote = self.cache.get_option(row["pe_strike"], "PE")
+            if not ce_quote or not pe_quote:
+                continue
+            try:
+                quote_times = [
+                    value for value in (
+                        ce_quote.get("timestamp"), pe_quote.get("timestamp")
+                    ) if isinstance(value, datetime)
+                ]
+                as_of = (
+                    datetime.now(tz=quote_times[0].tzinfo)
+                    if quote_times else None
+                )
+                affordability = build_capital_affordability(
+                    ce_ask=float(ce_quote.get("ask", ce_quote.get("last", 0.0))),
+                    pe_ask=float(pe_quote.get("ask", pe_quote.get("last", 0.0))),
+                    lot_size=self.spec.lot_size,
+                    available_capital=available_capital,
+                    deployment_fraction=self.config.max_capital_deployment_pct,
+                    ce_quote_time=ce_quote.get("timestamp"),
+                    pe_quote_time=pe_quote.get("timestamp"),
+                    as_of=as_of,
+                )
+            except (TypeError, ValueError):
+                continue
+            row.update(affordability.as_dict())
         if top is None:
             return IndexScanResult(self.spec.symbol, None, tuple(diagnostics))
 
@@ -158,13 +248,19 @@ class IndexScanner:
             self.config,
         )
         if not valid:
+            context = diagnostics[0] if diagnostics else {}
             diagnostics.insert(0, {
                 "index": self.spec.symbol,
+                "timestamp": context.get("timestamp"),
+                "cycle_id": context.get("cycle_id", cycle_id),
+                "spot": spot,
+                "atm": atm_strike,
                 "result": "FAIL",
                 "reason": "FINAL_VALIDATION_FAILED",
                 "details": reason,
                 "ce_strike": top.ce_strike,
                 "pe_strike": top.pe_strike,
+                **universe_fields,
             })
             return IndexScanResult(self.spec.symbol, None, tuple(diagnostics))
         return IndexScanResult(

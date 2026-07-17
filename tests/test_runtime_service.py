@@ -3,6 +3,7 @@ from datetime import datetime
 
 from application.diagnostic_capture import DiagnosticCaptureService
 from application.runtime_service import RuntimeService
+from application.system_health import SystemHealthSnapshot
 from core.models import Trade
 
 
@@ -74,3 +75,22 @@ def test_runtime_snapshot_exposes_server_authoritative_market_phase():
     assert snapshot.market_phase == "OBSERVATION_WARMUP"
     assert snapshot.seconds_to_next_phase == 600
     assert "entries begin at 09:30" in snapshot.market_status
+
+
+def test_runtime_snapshot_exposes_injected_real_system_health():
+    runtime = RuntimeService(
+        lambda: FakeEngine(),
+        health_provider=lambda: SystemHealthSnapshot(
+            cpu_percent=81.0,
+            memory_percent=72.0,
+            status="WARNING",
+            explanation="Warning: CPU is at or above 75%.",
+        ),
+    )
+
+    assert runtime.snapshot().system_health == {
+        "cpu_percent": 81.0,
+        "memory_percent": 72.0,
+        "status": "WARNING",
+        "explanation": "Warning: CPU is at or above 75%.",
+    }

@@ -38,3 +38,81 @@ def test_exports_are_deterministic_for_ui_downloads():
 
     assert json.loads(capture.to_json())[0]["symbol"] == "NIFTY"
     assert capture.to_csv().splitlines() == ["result,symbol", "FAIL,NIFTY"]
+
+
+def test_top_n_is_retained_per_index_and_cycle_regardless_of_scan_order():
+    capture = DiagnosticCaptureService(max_rows=100)
+    capture.start(5)
+    rows = []
+    for rank in range(1, 7):
+        rows.extend([
+            {"cycle_id": "cycle-1", "index": "BANKNIFTY", "rank": rank},
+            {"cycle_id": "cycle-1", "index": "NIFTY", "rank": rank},
+        ])
+
+    capture.record(reversed(rows))
+
+    visible = capture.snapshot().rows
+    assert {
+        symbol: sorted(row["rank"] for row in visible if row["index"] == symbol)
+        for symbol in ("NIFTY", "BANKNIFTY")
+    } == {
+        "NIFTY": [1, 2, 3, 4, 5],
+        "BANKNIFTY": [1, 2, 3, 4, 5],
+    }
+    assert len(json.loads(capture.to_json())) == 12
+
+
+def test_capture_bounds_full_history_independently_per_index():
+    capture = DiagnosticCaptureService(max_rows=2)
+    capture.start(5)
+    capture.record([
+        {"cycle_id": "c1", "index": "NIFTY", "rank": 1},
+        {"cycle_id": "c1", "index": "BANKNIFTY", "rank": 1},
+        {"cycle_id": "c2", "index": "NIFTY", "rank": 1},
+        {"cycle_id": "c2", "index": "BANKNIFTY", "rank": 1},
+        {"cycle_id": "c3", "index": "NIFTY", "rank": 1},
+    ])
+
+    exported = json.loads(capture.to_json())
+    assert [(row["index"], row["cycle_id"]) for row in exported] == [
+        ("BANKNIFTY", "c1"),
+        ("NIFTY", "c2"),
+        ("BANKNIFTY", "c2"),
+        ("NIFTY", "c3"),
+    ]
+
+
+def test_live_snapshot_keeps_only_latest_cycle_per_index_but_exports_history():
+    capture = DiagnosticCaptureService(max_rows=100)
+    capture.start(5)
+    capture.record([
+        {"cycle_id": "nifty-old", "index": "NIFTY", "rank": 1, "pair": "old"},
+        {"cycle_id": "bank-current", "index": "BANKNIFTY", "rank": 2, "pair": "bank-2"},
+        {"cycle_id": "bank-current", "index": "BANKNIFTY", "rank": 1, "pair": "bank-1"},
+        {"cycle_id": "nifty-current", "index": "NIFTY", "rank": 2, "pair": "nifty-2"},
+        {"cycle_id": "nifty-current", "index": "NIFTY", "rank": 1, "pair": "nifty-1"},
+    ])
+
+    visible = capture.snapshot().rows
+
+    assert [(row["index"], row["cycle_id"], row["rank"]) for row in visible] == [
+        ("BANKNIFTY", "bank-current", 1),
+        ("BANKNIFTY", "bank-current", 2),
+        ("NIFTY", "nifty-current", 1),
+        ("NIFTY", "nifty-current", 2),
+    ]
+    assert len(capture.snapshot().full_rows) == 5
+    assert len(json.loads(capture.to_json())) == 5
+
+
+def test_latest_cycle_prefers_ranked_pairs_over_wait_record():
+    capture = DiagnosticCaptureService(max_rows=100)
+    capture.start(5)
+    capture.record([
+        {"cycle_id": "c1", "index": "NIFTY", "result": "WAIT", "reason": "CANDLES_PENDING"},
+        {"cycle_id": "c1", "index": "NIFTY", "rank": 2, "result": "FAIL"},
+        {"cycle_id": "c1", "index": "NIFTY", "rank": 1, "result": "PASS"},
+    ])
+
+    assert [row.get("rank") for row in capture.snapshot().rows] == [1, 2]

@@ -57,7 +57,7 @@ describe("operational dashboard panels", () => {
     const onStop = vi.fn();
     const { rerender } = render(<PairDiagnostics diagnostics={{ capturing: false, top_count: 5, rows: [] }} onStart={onStart} onStop={onStop} />);
 
-    expect(screen.getByText(/NIFTY scanner feed is connected/i)).toBeInTheDocument();
+    expect(screen.getByText(/No captured scan rows.*completed-candle scans/i)).toBeInTheDocument();
 
     await userEvent.click(screen.getByRole("button", { name: /Start capture/i }));
     expect(onStart).toHaveBeenCalledWith(5);
@@ -67,7 +67,7 @@ describe("operational dashboard panels", () => {
     expect(onStop).toHaveBeenCalledTimes(1);
   });
 
-  it("renders journal quantity and net result", () => {
+  it("renders journal quantity, net result, and period filters", async () => {
     render(<TradeJournal trades={[{
       trade_id: "closed-1", execution_mode: "PAPER", index_symbol: "FINNIFTY", direction: "LONG_CE", regime: "DIRECTIONAL",
       phase: "CLOSED", ce_strike: 24200, pe_strike: 24200, ce_entry: 100, pe_entry: 98,
@@ -75,12 +75,15 @@ describe("operational dashboard panels", () => {
       entry_time: "2026-07-15T10:00:00", exit_time: "2026-07-15T10:05:00", exit_reason: "TARGET_HIT",
       gross_pnl: 1755, transaction_costs: 120, net_pnl: 1635, hard_stop_loss: 900, post_daily_sl: false
     }]} />);
+    expect(screen.getByRole("button", { name: "Today" })).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "All" }));
     expect(screen.getByText("3 / 195")).toBeInTheDocument();
     expect(screen.getByText("FINNIFTY")).toBeInTheDocument();
+    expect(screen.getByText(/1 visible trade/i)).toBeInTheDocument();
     expect(screen.getByText("₹1,635.00")).toBeInTheDocument();
   });
 
-  it("shows PAPER equity and audit transaction note", () => {
+  it("uses a clear simulated deposit and withdrawal workflow", async () => {
     const onAdjust = vi.fn();
     render(<CapitalPanel onAdjust={onAdjust} engineRunning={false} capital={{
       mode: "PAPER", base_capital: 45000, realized_pnl: -1000, cash_adjustments: 6000,
@@ -89,6 +92,20 @@ describe("operational dashboard panels", () => {
     }} />);
     expect(screen.getByText("₹50,000.00")).toBeInTheDocument();
     expect(screen.getByText("Test refill")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /Apply PAPER target/i })).toBeEnabled();
+    expect(screen.getByText("Available PAPER Money")).toBeInTheDocument();
+    expect(screen.getByText("PAPER Trading P&L")).toBeInTheDocument();
+    expect(screen.getByText("Net Deposits / Withdrawals")).toBeInTheDocument();
+    expect(screen.queryByText("Base capital")).not.toBeInTheDocument();
+    expect(screen.queryByText("Read only")).not.toBeInTheDocument();
+    const amountInput = screen.getByRole("textbox", { name: /Amount/i });
+    expect(amountInput).toHaveAttribute("inputmode", "decimal");
+    await userEvent.type(amountInput, "5000");
+    const noteInput = screen.getByRole("textbox", { name: /Audit note/i });
+    expect(noteInput).toHaveValue("PAPER test money adjustment");
+    await userEvent.clear(noteInput);
+    await userEvent.type(noteInput, "Paper refill");
+    expect(screen.getByText(/Resulting available money/i)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: /Apply PAPER deposit/i }));
+    expect(onAdjust).toHaveBeenCalledWith(55000, "Paper refill");
   });
 });

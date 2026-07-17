@@ -8,6 +8,7 @@ from typing import Callable, Protocol
 from application.diagnostic_capture import DiagnosticCaptureService
 from application.index_selection import IndexSelectionService
 from application.market_session import MarketSessionSchedule
+from application.system_health import SystemHealthService, SystemHealthSnapshot
 
 
 class EnginePort(Protocol):
@@ -29,6 +30,7 @@ class RuntimeSnapshot:
     market_phase: str
     market_status: str
     seconds_to_next_phase: int
+    system_health: dict[str, object]
 
 
 class RuntimeService:
@@ -38,12 +40,14 @@ class RuntimeService:
         self,
         engine_factory: Callable[[], EnginePort],
         now_provider: Callable[[], datetime] | None = None,
+        health_provider: Callable[[], SystemHealthSnapshot] | None = None,
     ) -> None:
         self._factory = engine_factory
         self._engine: EnginePort | None = None
         self._lock = RLock()
         self._now_provider = now_provider or datetime.now
         self._market_schedule = MarketSessionSchedule()
+        self._health_provider = health_provider or SystemHealthService().snapshot
 
     @property
     def engine(self) -> EnginePort | None:
@@ -68,6 +72,7 @@ class RuntimeService:
                 market_phase=market.phase.value,
                 market_status=market.message,
                 seconds_to_next_phase=market.seconds_to_next_phase,
+                system_health=self._health_provider().as_dict(),
             )
 
     def start(self) -> RuntimeSnapshot:

@@ -146,3 +146,26 @@ def test_runtime_requires_completed_candles_per_index():
     assert calls == []
     assert cycle.outcome.reason == "NO_EXECUTABLE_CANDIDATE"
     assert diagnostics[0].diagnostics[0]["reason"] == "COMPLETED_CANDLES_NOT_READY"
+
+
+def test_rotation_scan_compares_all_tradable_indices_without_executing_entry():
+    registry = IndexRegistry.default()
+    selection = IndexSelectionService(registry)
+    caches = MarketCacheRegistry.default()
+    candles = CompletedCandleStore()
+    _seed_market_data(caches, candles)
+    calls, executed, diagnostics = [], [], []
+    runtime = _runtime(registry, selection, caches, candles, calls, executed, diagnostics)
+
+    cycle = runtime.scan_for_rotation(
+        now=datetime(2026, 7, 17, 10, 31),
+        realized_pnl=0.0,
+        available_capital=45_000.0,
+    )
+
+    assert {symbol for symbol, _, _ in calls} == set(registry.symbols)
+    assert executed == []
+    assert cycle.winner is not None
+    assert cycle.winner.index_symbol == "BANKNIFTY"
+    assert {scan.index_symbol for scan in cycle.scans} == set(registry.symbols)
+    assert {scan.index_symbol for scan in diagnostics} == set(registry.symbols)

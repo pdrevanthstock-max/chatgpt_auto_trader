@@ -62,6 +62,7 @@ export interface CapitalSnapshot {
 export interface DiagnosticSnapshot {
   capturing: boolean;
   top_count: 5 | 10;
+  /** Flat rows remain the compatibility contract; monitoring fields are additive and optional. */
   rows: Record<string, unknown>[];
 }
 
@@ -73,6 +74,14 @@ export interface RuntimeSnapshot {
   market_phase: string;
   market_status: string;
   seconds_to_next_phase: number;
+  system_health?: SystemHealthSnapshot;
+}
+
+export interface SystemHealthSnapshot {
+  cpu_percent: number | null;
+  memory_percent: number | null;
+  status: "NORMAL" | "WARNING" | "CRITICAL" | "UNAVAILABLE";
+  explanation: string;
 }
 
 export interface RuntimeEvent {

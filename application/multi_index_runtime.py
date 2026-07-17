@@ -13,7 +13,7 @@ from application.multi_index_coordinator import (
     RankedCandidate,
 )
 from application.position_reservation import PositionReservation
-from core.index_registry import IndexRegistry, IndexSpec
+from core.index_registry import IndexPermission, IndexRegistry, IndexSpec
 from core.models import Trade
 from data.candle_store import CompletedCandleStore, completed_candles, spot_candle_key
 from data.market_cache import MarketCache, MarketCacheRegistry
@@ -43,6 +43,13 @@ class MultiIndexCycle:
     market_states: tuple[IndexMarketState, ...]
 
 
+@dataclass(frozen=True)
+class RotationScanCycle:
+    winner: IndexScanResult | None
+    scans: tuple[IndexScanResult, ...]
+    market_states: tuple[IndexMarketState, ...]
+
+
 class MultiIndexRuntime:
     """Owns isolated per-index regime/scanner contexts and global selection."""
 
@@ -64,6 +71,7 @@ class MultiIndexRuntime:
         self.selection = selection
         self.reservation = reservation
         self.config = config
+        self._record_diagnostics = record_diagnostics
         self.candle_store = candle_store or completed_candles
         factory = scanner_factory or (
             lambda spec, cache, current_config: IndexScanner(
@@ -124,19 +132,15 @@ class MultiIndexRuntime:
             normalized, True, regime, spot_trend, len(candles), None
         )
 
-    def scan(
+    def _collect_scans(
         self,
         *,
         now: datetime,
         realized_pnl: float,
         active_trade: Trade | None,
         available_capital: float,
-    ) -> MultiIndexCycle:
+    ) -> tuple[list[IndexScanResult], list[IndexMarketState]]:
         selected = self.selection.snapshot()
-        if selected.pause_new_entries:
-            outcome = self.coordinator.coordinate([])
-            return MultiIndexCycle(outcome, ())
-
         scans: list[IndexScanResult] = []
         states: list[IndexMarketState] = []
         for symbol in sorted(selected.symbols):
@@ -166,6 +170,68 @@ class MultiIndexRuntime:
                 active_trade=active_trade,
                 available_capital=available_capital,
                 trading_day=now.date(),
+                cycle_id=now.isoformat(),
             ))
+        return scans, states
+
+    def scan(
+        self,
+        *,
+        now: datetime,
+        realized_pnl: float,
+        active_trade: Trade | None,
+        available_capital: float,
+    ) -> MultiIndexCycle:
+        selected = self.selection.snapshot()
+        if selected.pause_new_entries:
+            outcome = self.coordinator.coordinate([])
+            return MultiIndexCycle(outcome, ())
+
+        scans, states = self._collect_scans(
+            now=now,
+            realized_pnl=realized_pnl,
+            active_trade=active_trade,
+            available_capital=available_capital,
+        )
         outcome = self.coordinator.coordinate(scans)
         return MultiIndexCycle(outcome, tuple(states))
+
+    def scan_for_rotation(
+        self,
+        *,
+        now: datetime,
+        realized_pnl: float,
+        available_capital: float,
+    ) -> RotationScanCycle:
+        """Evaluate selected indices without dispatching a second entry."""
+        selected = self.selection.snapshot()
+        if selected.pause_new_entries:
+            self._record_diagnostics([])
+            return RotationScanCycle(None, (), ())
+
+        scans, states = self._collect_scans(
+            now=now,
+            realized_pnl=realized_pnl,
+            # A replacement is validated as the next position after the active
+            # trade closes; the global reservation remains owned throughout.
+            active_trade=None,
+            available_capital=available_capital,
+        )
+        self._record_diagnostics(scans)
+        eligible = [
+            scan
+            for scan in scans
+            if scan.candidate is not None
+            and scan.index_symbol in selected.symbols
+            and self.registry.get(scan.index_symbol).permission is IndexPermission.TRADABLE
+        ]
+        winner = max(
+            eligible,
+            key=lambda scan: (
+                float(scan.candidate.projected_net),
+                float(scan.candidate.confidence),
+                str(scan.index_symbol),
+            ),
+            default=None,
+        )
+        return RotationScanCycle(winner, tuple(scans), tuple(states))

@@ -1082,3 +1082,182 @@ Completion requires fresh test output plus code/UI review; passing unit tests al
 - Branch push succeeded to `origin/codex/multi-index-atm-itm-runtime` with upstream tracking.
 - GitHub App PR creation lacked repository integration permission (`403`), so the authenticated GitHub CLI fallback created draft PR #4: `https://github.com/pdrevanthstock-max/chatgpt_auto_trader/pull/4`.
 - PR description explicitly states that the newly approved Pair Inspector redesign is a follow-up and is not falsely represented as implemented in this publication.
+
+### 2026-07-16 — GitHub ownership policy, branch protection, and exact runtime cadence
+
+- User established a new publication boundary: Codex may make and verify local changes, but the user alone will perform Git commits, pushes, merges, and GitHub updates unless this instruction is explicitly reversed. No Git staging, commit, push, merge, or branch-protection mutation was performed in this response.
+- GitHub displayed the warning that `main` is not protected. Recommended single-owner protection is an active branch ruleset targeting `main` with pull requests required, zero mandatory approvals, conversation resolution required, force pushes blocked, and deletion restricted. Zero approvals is intentional because the repository currently has one owner and requiring one approval would prevent that owner from approving their own pull request. Required status checks should be enabled only after a CI workflow exists and exposes stable check names. “Lock branch” should not be enabled because it makes the branch read-only rather than preserving the normal pull-request merge workflow.
+- A verified, detailed runtime reference was added locally at `docs/AUTOTRADER_RUNTIME_ARCHITECTURE.md`. It corrects the older README architecture where necessary: the current source uses a five-second batched Dhan quote poll, not a tick WebSocket feed, and the executable pair universe is dynamic ATM/ITM rather than the historical ATM ±10 matrix.
+- Exact market-data cadence and shape:
+  - once every five seconds, the feed builds one combined request for all five index spot IDs plus their current dynamic option instruments;
+  - after current spots exist, the normal payload is approximately five spot instruments plus up to fifty option instruments (five CE and five PE per index), with active-position strikes retained even if the ATM moves;
+  - one failed/empty/invalid quote cycle has a bounded maximum of three attempts with a 0.5-second base delay and no fabricated quote fallback;
+  - the single response is processed sequentially and demultiplexed by security ID into five isolated market caches and one-minute candle series.
+- Exact engine cadence and concurrency:
+  - the engine thread wakes every one second;
+  - an open position always takes the one-second risk/exit path and suppresses new-entry scanning;
+  - while flat and inside the entry window, `MultiIndexRuntime.scan()` is eligible every sixty seconds;
+  - selected indices are scanned sequentially in sorted order—BANKNIFTY, FINNIFTY, MIDCPNIFTY, NIFTY, NIFTYNXT50—not by five parallel strategy threads;
+  - each scan uses an isolated index context and requires ten completed one-minute spot candles for that index;
+  - after every selected index is evaluated, the global coordinator compares executable candidates; only NIFTY, BANKNIFTY, and FINNIFTY can win, while MIDCPNIFTY and NIFTYNXT50 remain observe-only;
+  - a global reservation and serialized FIFO execution worker preserve exactly one active position across all indices.
+- Exact browser cadence:
+  - the backend WebSocket emits runtime/position/diagnostic snapshots every one second per connected browser;
+  - React launches its read-only performance, trades, and capital refreshes every five seconds;
+  - closing or breaking the browser does not stop the backend risk/exit loop.
+- A new browser visual, `runtime-call-frequency-architecture.html`, was published to the already-approved key-protected visual companion. It distinguishes batched network I/O, sequential in-process scanning, isolated index state, event-driven execution, and hard safety boundaries.
+- Pair Inspector fairness and bounded-table improvements remain designed but not implemented: BANKNIFTY can still dominate capture because the current global Top-N slice occurs after alphabetical flattening. The approved follow-up is fair Top 5/10 per index, a maximum of 20 ordered visible columns, fixed-height pagination/scrolling, full-fidelity downloads, and server-authoritative dynamic strike tiles.
+
+### 2026-07-17 — Strategy-first audit reconciliation and newly confirmed execution blocker
+
+- User reported that Pair Inspector appeared to show only BANKNIFTY ATM/ATM rows, requested simultaneous comparison across the three tradable indices, supplied Antigravity and Claude audits, requested a more advanced visualization UI, and asked for a more productive requirements/verification workflow. Authentication, LIVE PIN, and backtest completion were explicitly parked while strategy correctness is addressed first.
+- Read-only runtime evidence disproved an actual return to the old ATM-only generator:
+  - the current diagnostic snapshot contains 680 scored pairs, of which 602 are cross-strike and 78 are matched-strike;
+  - the PAPER engine actually executed NIFTY 24,050 CE / 24,100 PE at 13:34 on 2026-07-16, proving cross-strike selection reached execution;
+  - the generator constructs CE ATM/ITM0–4 × PE ATM/ITM0–4 (25 pairs normally, 16 ITM×ITM pairs on SIDEWAYS expiry sessions).
+- Pair Inspector's BANKNIFTY dominance is a confirmed observability bug. `MultiIndexRuntime` scans selected symbols in sorted order, `_record_multi_index_diagnostics` flattens those results, then records only the first global Top 5/10 rows. BANKNIFTY therefore consumes every visible allocation before FINNIFTY, NIFTY, and the observe-only indices. All five indices warmed synchronously and were reported ready/scanned in the engine journal; the claim that only BANKNIFTY reached ten candles is false.
+- A more serious, previously missed production-path defect was confirmed from source and logs:
+  - at 13:34 the coordinator executed the NIFTY cross pair;
+  - at 13:35 the position exited successfully;
+  - every subsequent scan through the end of the captured session returned `POSITION_SLOT_UNAVAILABLE`;
+  - the successful `EXIT_BOTH` path sets `active_trade = None` but never releases `_position_reservation_token`.
+  This reservation leak, not ATM-only generation, blocked every later trade after the first exit. Existing tests cover failed-entry release but omit successful-exit release.
+- Non-NIFTY rotation is also confirmed unsafe: `RotationEngine` reads the legacy global NIFTY cache and hardcodes `config.nifty_lot_size` when evaluating an active position. BANKNIFTY/FINNIFTY rotations can therefore use the wrong quotes, cost basis, and score even though the caller supplies an index symbol.
+- The liquidity stage has an observability gap: contracts are removed before divergence diagnostics are built, so rejected legs/pairs and exact spread reasons are invisible. The audit's claim that cross pairs are all removed by a strict absolute spread is not supported—the current emergency gate is the greater of ₹0.50 or 5% of mid, and 602 cross pairs passed it.
+- External recommendations disposition:
+  - valid: fair Top N per index, prefilter rejection diagnostics, index-aware rotation cache/lot size, exact profitability golden tests, and end-to-end real-scanner multi-index competition tests;
+  - hypothesis only: Delta-normalized velocity and a 0.75% divergence floor; both require reliable data and out-of-sample backtests before production use;
+  - rejected as unsafe/unproven: premium-ratio increase from 2.5 to 10, spread relaxation from 5% to 15%, removal of both-OTM protection, the supplied selector that disables SIDEWAYS trades and swallows exceptions, and the hand-written WebSocket client that lacks spot subscriptions/candle aggregation and assumes the wrong response handling.
+- Rejection counts from the retained snapshot: 455 `ZERO_SAFE_QUANTITY`, 141 divergence-band failures, 71 projected-net failures, and 13 dual-decay failures. Zero-safe-quantity is a real capital-fit result based on option premium × lot size, not a reason to weaken safety. A winning leg does not guarantee positive gross P&L because entry pays ask while projected exit starts from bid, and the other leg plus spread can outweigh the winner.
+- Recommended strategy-first correction package awaiting approval:
+  1. release the global reservation on every terminal close/failure path and prove a second entry can occur;
+  2. make rotation cache/lot-size/index aware;
+  3. record Top N per index per scan cycle plus generated→liquidity→signal→profitability→validation funnel counts;
+  4. add real-scanner three-tradable-index competition and profitability golden-vector tests;
+  5. keep current OTM, premium-ratio, spread, projected-net, and PAPER broker-write safety rules unchanged;
+  6. then implement the approved strategy-monitoring UI: per-index summary, 5×5/4×4 cross-pair heatmap, fixed bounded table, rejection funnel, global winner comparison, and dynamic strike-universe cards.
+- Productivity recommendation: establish three concise sources of truth after strategy package approval—a stable strategy requirements document, a requirement→code→test→UI traceability matrix, and a market-session runtime validation checklist. A feature is not complete until all four evidence columns are present. No Git staging, commit, push, merge, broker order, or config date modification occurred during this audit.
+
+### 2026-07-17 — Mandatory change-impact contract and global background rotation requirement restored
+
+- User required every future recommendation/package to state explicitly: features retained unchanged, features modified, features removed/replaced, benefits, entries/opportunities that will disappear, entries/opportunities newly enabled, concrete result examples, and UI/runtime evidence expected after implementation. Silent removal of an existing requirement is prohibited.
+- Git history reconstructed the cross-pair regression:
+  - original versions generated a CE×PE Cartesian cross matrix;
+  - commit `170a341` on 2026-07-15 replaced that generator with one matched-ATM pair without a recorded explicit user approval to remove cross-pair selection;
+  - commit `c0c2c00` on 2026-07-16 restored cross-pair execution as the user-approved bounded ATM/ITM 5×5 universe;
+  - current behavior therefore retains cross pairs, but intentionally does not restore the unsafe old unrestricted ATM±10/OTM matrix. The current approved universe is five CE ATM/ITM strikes crossed with five PE ATM/ITM strikes, or 16 ITM×ITM pairs during SIDEWAYS expiry conditions.
+- User reiterated the active-position replacement requirement: while one trade is open, one-second risk/exit monitoring must continue, but the engine must also keep evaluating new completed-candle opportunities. If a materially better opportunity appears and the current trade has covered its economic switching threshold, the engine should atomically close the current trade and rotate into the better pair.
+- Current code does not fully satisfy that requirement:
+  - the main one-second loop returns immediately after active-position monitoring and does not invoke the normal global multi-index scan;
+  - `_check_rotation_live` evaluates only candidates from the active trade's own index;
+  - it cannot select a superior opportunity from another selected tradable index;
+  - the fixed ₹103 rotation floor is a legacy estimate rather than current order/turnover-based Dhan economics;
+  - rotation scoring still uses the legacy NIFTY cache and NIFTY lot size internally.
+- Recommended target awaiting explicit approval:
+  - retain one-second active risk/exit checks;
+  - every 60 seconds/on each newly completed candle, scan every selected index even while a position is active, but use those results only for diagnostics/rotation—not a second concurrent entry;
+  - compare the best eligible NIFTY/BANKNIFTY/FINNIFTY replacement against the active position using index-correct quotes, lot size, Dhan costs and slippage;
+  - replace the fixed ₹103 rule with an explicit cost-aware threshold selected by the user;
+  - preserve the global reservation during the atomic close→replacement transition and release it if replacement execution fails;
+  - preserve cooldown, final-entry cutoff, stale-data, dual-decay, premium-ratio, projected-net, capital, and all PAPER broker-write protections.
+- No strategy code was changed in this response. The new change-impact requirement and historical correction were documented before further implementation.
+
+### 2026-07-17 — Controlled OTM research reopened; capital visibility and per-index Top N clarified
+
+- User reopened OTM×OTM evaluation and requested that the externally proposed safeguards be listed rather than treating all OTM pairs as permanently excluded. They explicitly retained dual-decay, premium-ratio, projected-net, stale/asynchronous-price and related integrity gates.
+- Both external reports were reviewed completely. Antigravity's supplied `OTMExpiryGuard` proposed: minimum premium ₹15 per leg, maximum strike distance 1% of spot, expiry-day cutoff 12:00, and IV percentile no higher than 65. Its broader handover also proposed increasing premium ratio to 10, increasing spread tolerance to 15%, and removing the OTM rejection generally.
+- Technical disposition:
+  - retain the ₹15 floor concept and 12:00 expiry cutoff as useful PAPER safeguards;
+  - replace the 1%-of-spot distance rule with explicit index-relative OTM1/OTM2 steps because 1% represents a different and potentially excessive number of strikes across indices;
+  - do not claim/enforce IV-percentile ≤65 until a reliable synchronized live Greeks/IV source is connected; current quote polling does not populate IV percentile;
+  - continue rejecting the proposed ratio 10 and spread 15% relaxations as unsafe/unproven;
+  - do not remove the OTM block globally or for LIVE. The proposed first version is a narrowly guarded PAPER-only exception.
+- Recommended OTM research universe awaiting approval:
+  - preserve all existing 25 ATM/ITM cross pairs;
+  - add only CE OTM1–OTM2 × PE OTM1–OTM2, four additional OTM×OTM pairs per tradable index;
+  - permit them only in confirmed DIRECTIONAL regimes with the winning leg aligned to spot direction;
+  - on expiry day permit them only before 12:00; SIDEWAYS expiry continues to exclude OTM;
+  - preserve fresh synchronized completed candles, both-decay rejection, ratio 2.5, current execution-quality spread gate, minimum ₹15 each leg, positive quantity, projected net ≥ configured buffer, minimum return, costs/slippage, final validation, and PAPER-only execution;
+  - track OTM results separately so they cannot be mistaken for the established ATM/ITM strategy.
+- Explicit impact: current ATM/ITM entries are not removed. Four new OTM pairs may compete for the one global slot and can displace an ATM/ITM winner if their guarded projected net ranks higher; the UI and journal must record candidate class and the displaced runner-up. The existing both-OTM rejection would be replaced only by a scoped guard-approved PAPER exception.
+- Capital mechanics clarified using NSE's October 2025 lot revision, which applies to 2026 contracts: NIFTY 65, BANKNIFTY 30, FINNIFTY 60. Buying-option cash is driven by combined option premium × lot size, not directly by the numerical index level. Higher ITM intrinsic premium increases capital, while lower OTM premium reduces it but can allow dangerously larger quantities and suffer faster percentage decay.
+- With ₹45,000 PAPER equity and the configured 90% deployment ceiling, premium deployment budget is ₹40,500. Before charges, the maximum combined CE+PE ask that fits one lot is approximately: NIFTY ₹623.08, BANKNIFTY ₹1,350, FINNIFTY ₹675. These are thresholds, not live quotes; actual UI values must be calculated from current executable asks and leave the configured reserve for charges/slippage.
+- Required UI additions:
+  - per-index capital card with spot, ATM, expiry, lot size, available/deployable equity, CE ask, PE ask, combined premium, one-lot premium cost, estimated entry/round-trip charges, total cash requirement, maximum affordable lots, capital shortfall, maximum-loss premium and quote age;
+  - independent Top 5/10 table for each selected index, separate from the global winner comparison;
+  - rows show pair class (ATM/ITM or OTM research), strikes/moneyness, asks, one-lot cost, affordable lots, divergence, projected gross/cost/net, result and exact reason;
+  - global panel separately compares the best eligible candidate from NIFTY/BANKNIFTY/FINNIFTY and identifies the winner/runner-up.
+- No OTM, capital, strategy, UI, Git or broker mutation was performed; this remains a design decision awaiting approval.
+
+### 2026-07-17 — Approved strategy correction package implemented and verified
+
+- The user approved implementation and added a guarded SIDEWAYS divergence buffer for candidates near the prior 1-5% boundary. Final rule: 1-5% remains the normal SIDEWAYS band; 0.75-1% and 5-6% are admitted only when projected net is at least ₹200 and projected return is at least 0.50%; below 0.75% or above 6% is rejected. An 8% candidate remains eligible only in confirmed DIRECTIONAL mode, whose existing 1-10% band is unchanged.
+- Established cross-strike behavior is retained: 25 CE ATM/ITM0-4 × PE ATM/ITM0-4 pairs normally and 16 ITM×ITM pairs on SIDEWAYS expiry. No established pair was removed.
+- Added a narrow PAPER-only research universe of four CE OTM1/OTM2 × PE OTM1/OTM2 pairs. It requires confirmed directional alignment, ₹15 minimum ask on each leg, current dual-decay/ratio 2.5/price freshness/synchronization/projected economics/capital/final validation gates, and stops at 12:00 IST on expiry day. LIVE never receives these templates.
+- Fixed the successful-exit reservation leak: a confirmed normal close now releases the global position slot, allowing subsequent entries.
+- Restored active-position opportunity discovery without overlapping positions. One-second hard risk/exit monitoring remains first. When no immediate exit exists, a 60-second rotation-only scan evaluates all selected indices, records diagnostics, ignores observe-only indices for execution, and can enqueue only one serialized ROTATION—not a second ENTRY.
+- Rotation economics are now index aware. Active quotes and lot size come from the active trade's index cache/specification, active net P&L must cover at least ₹100 after costs, and the replacement must improve projected hold net by at least ₹100. The old NIFTY-global cache/lot dependency and ₹0.30 improvement comparison were removed.
+- Fixed Pair Inspector BANKNIFTY dominance by removing the global first-N prefix. Capture now retains Top 5/10 independently for every `(cycle_id, index)` and exports the full bounded per-index history.
+- Scanner diagnostics now include one shared multi-index cycle ID, rank, pair class, spot, ATM, CE/PE moneyness, funnel counts/reasons, and capital affordability from executable asks: combined ask, lot size, available/deployable equity, one-lot premium, max lots, estimated round-trip charges, shortfall, premium at risk, quote age and affordability.
+- React monitoring UI now uses a fixed 14-column primary table, per-index Top 5/10 tabs, established and OTM matrix visualization, rejection funnel/reason chips, capital cards, global winner/runner-up comparison and an accessible overflow details drawer. The full-width responsive layout no longer expands to 50-100 dynamic columns.
+- Architecture and change-impact records were added in `docs/AUTOTRADER_RUNTIME_ARCHITECTURE.md` and `docs/STRATEGY_CHANGE_PLAN_2026-07-17.md`. They state retained, added, modified and removed behavior explicitly.
+- Verification after all integration changes: Python `233 passed` with one third-party Starlette deprecation warning; frontend `11 passed`; production TypeScript/Vite build passed; `git diff --check` reported no whitespace errors. Backtest dates remain `2026-06-09` and `2026-07-13`.
+- No broker order, Git stage, commit or push was performed. PAPER broker-write protection remains in force. The user retains responsibility for reviewing and publishing the changes.
+- The local FastAPI/React service was safely reloaded while the engine was STOPPED and flat. The verified listener process was created at 02:54:32 IST, `/api/health` reports `PAPER_ONLY_DURING_BUILD`, `/api/runtime` reports `STOPPED`, PAPER mode, no active position, and the compiled page serves the new `index-CYAUipta.js` / `index-DgoKIg1K.css` assets. Reloading the service did not start the trading engine.
+
+### 2026-07-17 — Repeated expired-token UI error diagnosed; user requested guidance only
+
+- User updated the Dhan token but the UI continued reporting the previous expired-token error. They requested a repeatable manual recovery procedure and explicitly asked not to implement a fix yet.
+- Root cause was proven without printing credentials: `.env` contains one non-empty 303-character token and fresh Python imports the exact same fingerprint. The file was modified at 10:04:59 IST, while the API listener had been created at 02:54:32 IST.
+- `scripts/stop_web_app.ps1` reported that no managed PID file existed, so it did not stop the orphaned Uvicorn process. `Start-ScheduledTask` then launched the hidden script, which detected that port 8000 was already occupied and exited without replacing the process. Browser refresh also cannot reload credentials because `config.settings` stores Dhan credentials in module-level constants at process import.
+- A fresh standalone `DhanClient(orders_enabled=False).validate_credentials()` read-only positions query returned `VALID`. Therefore the saved token is valid and the failure is stale process memory, not another expired token.
+- Pending UI requirement, not implemented: when the engine is stopped and flat, show a clearly named `Reload credentials & retry authentication` action near PAPER runtime. It should re-read `.env`, validate through a read-only broker call, rebuild credential-dependent clients only after success, show safe diagnostics without exposing the token, and remain disabled while a position is open. Page refresh alone must not be presented as credential reload.
+- No strategy, authentication, service, broker-order, Git, or configuration code was changed during this diagnosis.
+
+### 2026-07-17 — UI usability defects and diagnostic data-contract causes confirmed
+
+- User supplied screenshots and requested a simpler PAPER capital workflow, journal filters for today/yesterday/week/month, CPU and memory status near runtime controls, dynamic two-row CE/PE strike-universe display, corrected independent rankings, and a global Top cross-pair comparison across NIFTY/BANKNIFTY/FINNIFTY with selection/runner-up explanations.
+- Confirmed matrix defect: React searches for moneyness values such as `ATM` and `ITM1`, while scanner rows contain `CE_ATM`, `CE_ITM1`, `PE_ATM`, and `PE_ITM1`. Consequently every 5×5 cell renders empty even though live rows contain current dynamic strikes.
+- Confirmed ranking defect: diagnostic snapshots currently retain visible Top N rows for every captured historical cycle. React groups all of them, slices before sorting, and can select legacy WAIT records without rank fields. This produces blank/zero-looking ranks and stale independent/global comparisons.
+- Confirmed field mismatch: the ranking Signal column reads `verdict/status/signal`, but backend rows expose `result`; it therefore displays `Pending` instead of PASS/FAIL. CE/PE columns also prefer moneyness labels and hide the requested numeric strikes.
+- Confirmed global-comparison defect: the component compares the highest projected-net row from all retained history per index rather than one coherent latest cycle and does not distinguish eligible PASS rows from rejected observations.
+- Capital is writable through the existing append-only target API only while the engine is stopped and flat, but the UI labels the whole panel `Read only`, places it at the bottom, and asks for a target equity without explaining the equation. Proposed replacement is an early-page linear equation (`starting capital + deposits/withdrawals + trading P&L = available equity`) plus explicit Add funds / Withdraw funds amount actions, preview and audit note. The backend target endpoint can remain for compatibility.
+- Exchange lot size must remain authoritative metadata, not a freely editable UI value. `max_lots` is dynamically calculated from deployable equity and current combined executable asks; zero correctly means no complete lot is affordable. The redesigned UI should show the exact shortfall and route the user to the capital adjustment action.
+- Proposed architecture awaiting approval: backend exposes only the latest coherent cycle per index for the live snapshot while retaining bounded full history for downloads; each row carries the dynamically generated established/OTM CE and PE strike lists; React replaces the 5×5 matrix with two simple strike rows; independent tables sort rank before limiting; global Top 5 combines the three tradable indices and explains eligibility, projected-net gap, confidence and rejection reason; a separate psutil-backed health snapshot reports real CPU/memory with unavailable state instead of fabricated fallback values.
+- No implementation was started pending design approval. No strategy rule, lot-size metadata, broker safety, Git state, or config date was changed.
+- User approved the dashboard design with one correction: remove Starting Capital/Base Capital from the UI because it adds confusion. The PAPER money panel will show Available PAPER Money, PAPER Trading P&L, and Net Deposits/Withdrawals, followed by explicit simulated Deposit/Withdraw amount actions. These local PAPER ledger values are dummy/simulated and must never touch Dhan funds. LIVE allocation remains separate and may use only the exact amount explicitly allocated in the LIVE UI, regardless of larger broker funds.
+- The complete approved design and change-impact contract was written and self-reviewed at `docs/superpowers/specs/2026-07-17-dashboard-usability-design.md`. No implementation code or Git operation was performed while awaiting written-spec review.
+
+### 2026-07-17 — Approved dashboard usability package implemented
+
+- The user approved the dashboard design and added one explicit requirement: every independent and global pair-ranking row must show the scan/selection time directly on screen. Timestamps are now visible as `Time (IST)` columns and are not confined to the Inspect drawer.
+- The implementation plan was recorded at `docs/superpowers/plans/2026-07-17-dashboard-usability.md`; the approved design was updated to include visible IST ranking timestamps.
+- Live diagnostic snapshots now expose only the latest completed capture cycle for each index. Ranked rows suppress WAIT placeholders when pair rows exist, sort numerically by rank, and apply Top 5/10 only after sorting. Bounded full capture history remains intact for CSV/JSON downloads.
+- Every scanner diagnostic row now carries dynamic option-chain-derived `ce_universe`, `pe_universe`, `research_ce_universe`, and `research_pe_universe` arrays with numeric strikes and ATM/ITM/OTM labels. Final-validation rejection rows retain the same context.
+- The Pair Inspector removed the empty 5×5 matrix. It now presents compact CE and PE strike rows, a separate guarded OTM-research section when present, per-index ranking tables with 15 fixed columns, and horizontal table scrolling.
+- Independent ranking now reads the backend `result` field, shows numeric strikes plus moneyness, exact reason, economics, affordable lots, exact capital shortfall, quote age, and visible IST time. Zero lots is explicitly displayed as insufficient PAPER money.
+- Global candidate comparison now produces a table of up to five candidates across NIFTY, BANKNIFTY, and FINNIFTY. PASS candidates rank ahead of rejected observations, followed by projected net, confidence and deterministic index tie-breaking. If none pass, it says `No executable global winner` and shows each index's strongest rejection. Confidence is presented only as a strategy score, not a guaranteed win probability.
+- PAPER capital moved directly below runtime and was simplified to Available PAPER Money, PAPER Trading P&L, and Net Deposits/Withdrawals. Starting/Base capital and the misleading Read only badge were removed. The UI uses Deposit/Withdraw amounts, mandatory audit note, before/adjustment/result preview, stopped-and-flat lock, and negative-equity prevention.
+- PAPER capital submission continues to use the existing append-only local ledger compatibility endpoint. It computes a target only at submission and never calls Dhan or changes real funds. LIVE allocation remains separate and restricted to the exact UI allocation.
+- Trade Journal now filters Today, Yesterday, Week, Month, and All using Asia/Kolkata calendar boundaries and entry time, with selected-period count and clear empty states.
+- Added real server system health using `psutil`: CPU warning/critical at 75/90%, memory warning/critical at 85/95%, and explicit Unavailable with null metrics when readings fail. No fabricated fallback percentages are used.
+- New modular files: `application/system_health.py`, `tests/test_system_health.py`, `webui/src/components/SystemHealth.tsx`, `SystemHealth.test.tsx`, `journalFilters.ts`, `journalFilters.test.ts`, `pairRanking.ts`, and `pairRanking.test.ts`.
+- Verification evidence after implementation:
+  - complete Python suite: 241 passed, one third-party Starlette/httpx deprecation warning;
+  - complete frontend suite: 7 files and 17 tests passed;
+  - TypeScript/Vite production build passed;
+  - `git diff --check` exited successfully;
+  - backtest dates remain `backtest_from_date: 2026-06-09` and `backtest_to_date: 2026-07-13`.
+- Runtime safety check: the currently installed service is still running the PAPER engine and reports no active position. It was deliberately not restarted while the engine is RUNNING. The newly built frontend assets are on disk, but backend additions such as system-health and latest-cycle metadata require a safe service reload only after the user stops the engine.
+- No broker order, Dhan fund action, Git stage, commit, push, merge, or branch cleanup was performed by Codex.
+
+### 2026-07-17 — Completed-candle warm-up and apparent one-time scan explained
+
+- User supplied Pair Inspector screenshot/logs showing `COMPLETED_CANDLES_NOT_READY` from 12:23 through 12:31 and asked whether capture scans only once.
+- Evidence confirms the engine and capture remained running. After the service/engine restart, the in-memory completed-candle store began again at one completed one-minute candle at 12:23, increased by one each minute, reached 9/10 at 12:31, and ran the first full multi-index strategy scan at 12:32. A second scan ran at 12:33. Configured scan interval is 60 seconds.
+- A completed candle is a closed one-minute spot OHLC/VWAP input. The runtime requires ten closed candles per selected index before regime and spot-trend classification; the currently forming partial minute is intentionally excluded.
+- Once ready, each cycle evaluates selected indices independently, creates dynamic ATM/ITM cross-pair templates from each current option chain, conditionally adds guarded PAPER-only OTM research pairs, then applies quote/freshness, dual-decay, divergence/direction, premium-ratio, projected economics, capital, and final-validation gates. NIFTY/BANKNIFTY/FINNIFTY can execute; MIDCPNIFTY/NIFTYNXT50 remain observe-only.
+- Pair Inspector capture is continuous while `Capturing` is shown, but the live screen intentionally replaces previous rows with the latest coherent cycle per index. CSV/JSON retain bounded full history. It is therefore a latest-snapshot view, not a one-time scan.
+- At the read-only check after warm-up, runtime activity showed scans at 12:32 and 12:33. Latest diagnostic rows existed for BANKNIFTY, FINNIFTY, MIDCPNIFTY and NIFTY; the three tradable indices had five rows each.
+- Separate confirmed diagnostics edge case: if an index becomes market-ready but its scanner returns zero candidate diagnostics, no new capture row is recorded, so its older WAIT row can remain visible. This affected NIFTYNXT50 in the read-only snapshot even though runtime activity classified it ready. This is a display/data-contract issue, not proof that the other indices stopped scanning.
+- Recommended future UI correction: replace pre-readiness global rankings with a Warm-up progress state showing per-index `n/10`, last full scan time, next scan time and scan sequence; emit an explicit current-cycle `NO_CANDIDATES` row when a ready scanner has no pairs so stale WAIT rows cannot persist. No code was changed pending user approval.

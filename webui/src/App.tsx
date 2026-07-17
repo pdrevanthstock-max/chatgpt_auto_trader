@@ -146,6 +146,7 @@ export default function App() {
     {workspace === "live" && <LiveReadinessWorkspace />}
     {workspace === "paper" && <>
     {runtime && <EngineControls runtime={runtime} busy={engineBusy} onStart={startEngine} onStop={stopEngine} />}
+    {capital && <CapitalPanel capital={capital} engineRunning={runtime?.state === "RUNNING"} hasOpenPosition={runtime?.has_active_position} onAdjust={adjustCapital} />}
     {!universe ? <section className="panel">Loading server-backed dashboard…</section> :
       <IndexSelector indices={universe.indices} selection={universe.selection} disabled={saving} onChange={updateSelection} />}
     <section className="dashboard-grid">
@@ -155,7 +156,6 @@ export default function App() {
     {diagnostics && <PairDiagnostics diagnostics={diagnostics} onStart={startDiagnostics} onStop={stopDiagnostics} />}
     <ActivityConsole events={events} connected={connected} />
     <TradeJournal trades={trades} />
-    {capital && <CapitalPanel capital={capital} engineRunning={runtime?.state === "RUNNING"} onAdjust={adjustCapital} />}
     </>}
   </main>;
 }

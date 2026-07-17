@@ -35,6 +35,14 @@ class TradingConfig:
     divergence_band_min: float = 1.0   # % change divergence lower band
     divergence_band_max: float = 5.0   # % change divergence upper band
     directional_divergence_band_max: float = 10.0
+    sideways_divergence_buffer_min: float = 0.75
+    sideways_divergence_buffer_max: float = 6.0
+    sideways_buffer_minimum_projected_net_profit: float = 200.0
+    sideways_buffer_minimum_projected_return_pct: float = 0.50
+    otm_research_enabled: bool = True
+    otm_research_minimum_ask: float = 15.0
+    otm_research_max_depth: int = 2
+    otm_research_expiry_cutoff: str = "12:00"
 
     # Exit parameters (Phase 1)
     giveback_pct: float = 0.10          # 10% giveback of peak profits

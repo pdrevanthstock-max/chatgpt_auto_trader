@@ -4,7 +4,7 @@ from core.models import Trade, ScoredCandidate
 from core.enums import MarketRegime, TradePhase, TradeDirection
 from config.settings import TradingConfig
 from strategy.rotation_engine import RotationEngine
-from data.market_cache import market_cache
+from data.market_cache import MarketCache, market_cache
 
 def test_rotation_engine_cooldown_and_logic():
     config = TradingConfig(
@@ -74,7 +74,7 @@ def test_rotation_compares_candidates_using_turnover_based_costs():
         pe_velocity=-2.0,
         divergence=10.0,
         winning_leg="CE",
-        projected_net_profit=550.20,
+        projected_net_profit=700.20,
         confidence=85.0,
     )
     market_cache.clear()
@@ -90,3 +90,85 @@ def test_rotation_compares_candidates_using_turnover_based_costs():
     )
 
     assert should_rotate is True
+
+
+def test_rotation_uses_banknifty_cache_lot_size_and_net_economics():
+    config = TradingConfig(minimum_projected_net_profit=100.0)
+    bank_cache = MarketCache(strike_step=100)
+    bank_cache.update_option(58_000, "CE", {"open": 100.0, "last": 110.0})
+    bank_cache.update_option(58_000, "PE", {"open": 100.0, "last": 110.0})
+    market_cache.clear()
+    trade = Trade(
+        index_symbol="BANKNIFTY",
+        strike_ce=58_000,
+        strike_pe=58_000,
+        entry_ce_price=100.0,
+        entry_pe_price=100.0,
+        ce_current_price=110.0,
+        pe_current_price=110.0,
+        quantity=2,
+        lot_size=30,
+    )
+    candidate = ScoredCandidate(
+        ce_strike=57_900,
+        pe_strike=58_100,
+        ce_velocity=8.0,
+        pe_velocity=-2.0,
+        divergence=10.0,
+        winning_leg="CE",
+        projected_net_profit=2_000.0,
+        confidence=90.0,
+    )
+
+    should_rotate, reason = RotationEngine().should_rotate(
+        trade,
+        candidate,
+        datetime(2026, 7, 17, 10, 0),
+        MarketRegime.DIRECTIONAL,
+        config,
+        cache=bank_cache,
+        lot_size=30,
+    )
+
+    assert should_rotate is True, reason
+
+
+def test_rotation_rejects_gross_profit_that_is_not_net_positive_after_costs():
+    config = TradingConfig(minimum_projected_net_profit=100.0)
+    cache = MarketCache(strike_step=100)
+    cache.update_option(58_000, "CE", {"open": 100.0, "last": 101.5})
+    cache.update_option(58_000, "PE", {"open": 100.0, "last": 101.5})
+    trade = Trade(
+        index_symbol="BANKNIFTY",
+        strike_ce=58_000,
+        strike_pe=58_000,
+        entry_ce_price=100.0,
+        entry_pe_price=100.0,
+        ce_current_price=101.5,
+        pe_current_price=101.5,
+        quantity=1,
+        lot_size=30,
+    )
+    candidate = ScoredCandidate(
+        ce_strike=57_900,
+        pe_strike=58_100,
+        ce_velocity=6.0,
+        pe_velocity=-1.0,
+        divergence=7.0,
+        winning_leg="CE",
+        projected_net_profit=1_000.0,
+        confidence=90.0,
+    )
+
+    should_rotate, reason = RotationEngine().should_rotate(
+        trade,
+        candidate,
+        datetime(2026, 7, 17, 10, 0),
+        MarketRegime.DIRECTIONAL,
+        config,
+        cache=cache,
+        lot_size=30,
+    )
+
+    assert should_rotate is False
+    assert "net" in reason.lower()

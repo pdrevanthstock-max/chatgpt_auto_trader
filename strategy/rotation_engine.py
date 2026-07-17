@@ -5,7 +5,7 @@ from core.models import Trade, ScoredCandidate
 from core.transaction_costs import calculate_option_round_trip_costs
 from core.enums import MarketRegime, TradePhase
 from config.settings import TradingConfig
-from data.market_cache import market_cache
+from data.market_cache import MarketCache, market_cache
 
 logger = logging.getLogger("AutoTrader")
 
@@ -40,7 +40,10 @@ class RotationEngine:
         top_candidate: ScoredCandidate,
         current_time: datetime,
         current_regime: MarketRegime,
-        config: TradingConfig
+        config: TradingConfig,
+        *,
+        cache: MarketCache | None = None,
+        lot_size: int | None = None,
     ) -> Tuple[bool, str]:
         """
         Runs the 5-condition check to decide if we rotate from active_trade to top_candidate.
@@ -58,9 +61,14 @@ class RotationEngine:
             if current_regime == MarketRegime.DIRECTIONAL:
                 return False, "Rotation paused during Directional Phase 2"
 
-        # Condition 3: Banked minimum profit floor (~Rs 103)
-        if active_trade.combined_pnl < config.rotation_min_profit_floor:
-            return False, f"PnL ₹{active_trade.combined_pnl:.2f} is below min floor ₹{config.rotation_min_profit_floor:.2f}"
+        # A rotation may bank the current trade only after its executable net
+        # P&L has covered the complete round-trip Dhan costs.
+        minimum_net = float(config.minimum_projected_net_profit)
+        if active_trade.net_pnl < minimum_net:
+            return False, (
+                f"Net PnL ₹{active_trade.net_pnl:.2f} is below rotation minimum "
+                f"₹{minimum_net:.2f} after costs"
+            )
 
         # Condition 5: Time remains (at least 60 seconds before 15:20 IST)
         eod_hour, eod_min = map(int, config.scan_end.split(":"))
@@ -70,7 +78,8 @@ class RotationEngine:
             return False, f"Insufficient time remaining before square-off ({time_remaining_sec:.1f}s)"
 
         # Calculate current trade's current score & divergence for comparison
-        chain = market_cache.get_option_chain()
+        active_cache = cache or market_cache
+        chain = active_cache.get_option_chain()
         ce_data = chain.get(active_trade.strike_ce, {}).get("CE")
         pe_data = chain.get(active_trade.strike_pe, {}).get("PE")
 
@@ -93,20 +102,31 @@ class RotationEngine:
         # Estimate current score of active trade
         active_combined_premium = ce_close + pe_close
         expected_combined_change_pct = (active_ce_vel * ce_close + active_pe_vel * pe_close) / active_combined_premium
-        expected_pnl = (expected_combined_change_pct / 100.0) * active_combined_premium * config.nifty_lot_size
+        contract_lot_size = int(lot_size or active_trade.lot_size)
+        expected_pnl = (
+            (expected_combined_change_pct / 100.0)
+            * active_combined_premium
+            * active_trade.quantity
+            * contract_lot_size
+        )
         estimated_costs = calculate_option_round_trip_costs(
             entry_ce_price=ce_close,
             entry_pe_price=pe_close,
             exit_ce_price=ce_close,
             exit_pe_price=pe_close,
-            lots=1,
-            lot_size=config.nifty_lot_size,
+            lots=active_trade.quantity,
+            lot_size=contract_lot_size,
         ).total
         active_score = expected_pnl - estimated_costs - 10.0
 
-        # Condition 1: Score hysteresis (new score > old score + 0.30)
-        if top_candidate.projected_net_profit <= active_score + 0.30:
-            return False, f"Candidate score {top_candidate.projected_net_profit:.2f} <= current score {active_score:.2f} + 0.30"
+        # Switching must add a full economic buffer, not merely beat a legacy
+        # fractional score by ₹0.30.
+        improvement_floor = float(config.minimum_projected_net_profit)
+        if top_candidate.projected_net_profit <= active_score + improvement_floor:
+            return False, (
+                f"Candidate net ₹{top_candidate.projected_net_profit:.2f} <= current hold "
+                f"net ₹{active_score:.2f} + improvement ₹{improvement_floor:.2f}"
+            )
 
         # Condition 2: Faster velocity
         if top_candidate.divergence <= active_div:

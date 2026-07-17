@@ -1,9 +1,10 @@
 import logging
-from datetime import date
+from datetime import date, datetime
 from typing import List, Tuple, Any
 from data.market_cache import MarketCache, market_cache
 from core.enums import MarketRegime
 from strategy.pair_templates import PairTemplateGenerator
+from strategy.otm_research_guard import OtmResearchGuard
 
 logger = logging.getLogger("AutoTrader")
 
@@ -27,6 +28,9 @@ class PairCandidateGenerator:
         self,
         regime: MarketRegime | None = None,
         trading_day: date | None = None,
+        *,
+        config: Any | None = None,
+        now: datetime | None = None,
     ) -> List[Tuple[Any, Any]]:
         chain = self.cache.get_option_chain()
         if not chain:
@@ -46,11 +50,20 @@ class PairCandidateGenerator:
         include_atm = not (
             expiry == day and regime == MarketRegime.SIDEWAYS
         )
-        return PairTemplateGenerator.atm_itm_cross(
+        scan_time = now or datetime.now()
+        include_otm_research = config is not None and OtmResearchGuard.template_allowed(
+            enabled=bool(getattr(config, "otm_research_enabled", False)),
+            execution_mode=str(getattr(config, "execution_mode", "BACKTEST")),
+            regime=regime,
+            now=scan_time,
+            expiry=expiry,
+        )
+        return PairTemplateGenerator.bounded_universe(
             ce_strikes=ce_strikes,
             pe_strikes=pe_strikes,
             spot=float(spot or 0.0),
             strike_step=self.strike_step,
             depth=self.depth,
             include_atm=include_atm,
+            include_otm_research=include_otm_research,
         )

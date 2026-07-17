@@ -3,6 +3,7 @@ from typing import List
 from core.models import CandidatePair
 from core.enums import MarketRegime
 from config.settings import TradingConfig
+from strategy.otm_research_guard import OtmResearchGuard
 
 logger = logging.getLogger("AutoTrader")
 
@@ -18,13 +19,18 @@ class EntrySignal:
         spot_trend: str,  # "UP", "DOWN", "SIDEWAYS"
         config: TradingConfig,
         spot_price: float = 0.0,
+        strike_step: int = 50,
     ) -> List[CandidatePair]:
         survivors = []
-        min_band = config.divergence_band_min
+        min_band = (
+            config.divergence_band_min
+            if regime == MarketRegime.DIRECTIONAL
+            else config.sideways_divergence_buffer_min
+        )
         max_band = (
             config.directional_divergence_band_max
             if regime == MarketRegime.DIRECTIONAL
-            else config.divergence_band_max
+            else config.sideways_divergence_buffer_max
         )
 
         for candidate in candidates:
@@ -37,7 +43,22 @@ class EntrySignal:
                 and candidate.ce_strike > spot_price
                 and candidate.pe_strike < spot_price
             ):
-                continue
+                if not (
+                    config.otm_research_enabled
+                    and config.execution_mode == "PAPER"
+                    and regime == MarketRegime.DIRECTIONAL
+                    and OtmResearchGuard.bounded_strikes(
+                        spot_price=spot_price,
+                        ce_strike=candidate.ce_strike,
+                        pe_strike=candidate.pe_strike,
+                        strike_step=strike_step,
+                    )
+                    and OtmResearchGuard.direction_aligned(
+                        spot_trend=spot_trend,
+                        winning_leg=candidate.winning_leg,
+                    )
+                ):
+                    continue
 
             # Condition 1: Divergence band check
             if not (min_band <= candidate.divergence <= max_band):

@@ -3,6 +3,8 @@ from typing import List, Optional
 from core.models import CandidatePair, ScoredCandidate
 from data.market_cache import MarketCache, market_cache
 from config.settings import TradingConfig
+from core.enums import MarketRegime
+from strategy.otm_research_guard import OtmResearchGuard
 from strategy.position_sizer import PositionSizer
 from strategy.profitability import ProfitabilityCalculator, ProfitabilityInput
 
@@ -17,6 +19,23 @@ class PairRanker:
         self.cache = cache or market_cache
         self.last_decisions: dict[tuple[object, object], dict[str, object]] = {}
 
+    @staticmethod
+    def economic_thresholds(
+        candidate: CandidatePair,
+        regime: MarketRegime,
+        config: TradingConfig,
+    ) -> tuple[float, float]:
+        in_sideways_buffer = regime == MarketRegime.SIDEWAYS and (
+            config.sideways_divergence_buffer_min <= candidate.divergence < config.divergence_band_min
+            or config.divergence_band_max < candidate.divergence <= config.sideways_divergence_buffer_max
+        )
+        if in_sideways_buffer:
+            return (
+                config.sideways_buffer_minimum_projected_net_profit,
+                config.sideways_buffer_minimum_projected_return_pct,
+            )
+        return config.minimum_projected_net_profit, config.minimum_projected_return_pct
+
     def rank_candidates(
         self,
         candidates: List[CandidatePair],
@@ -24,6 +43,7 @@ class PairRanker:
         momentum_multiplier: float = 1.0,
         lot_size: int | None = None,
         available_capital: float | None = None,
+        regime: MarketRegime = MarketRegime.SIDEWAYS,
     ) -> Optional[ScoredCandidate]:
         if not candidates:
             self.last_decisions = {}
@@ -60,6 +80,25 @@ class PairRanker:
                     "result": "FAIL", "reason": "NON_POSITIVE_EXECUTABLE_PRICE"
                 }
                 continue
+
+            spot, _ = self.cache.get_spot()
+            is_otm_research = OtmResearchGuard.bounded_strikes(
+                spot_price=float(spot or 0.0),
+                ce_strike=candidate.ce_strike,
+                pe_strike=candidate.pe_strike,
+                strike_step=self.cache.strike_step,
+            )
+            if is_otm_research:
+                if config.execution_mode != "PAPER" or not config.otm_research_enabled:
+                    self.last_decisions[(candidate.ce_strike, candidate.pe_strike)] = {
+                        "result": "FAIL", "reason": "OTM_RESEARCH_PAPER_ONLY"
+                    }
+                    continue
+                if ce_price < config.otm_research_minimum_ask or pe_price < config.otm_research_minimum_ask:
+                    self.last_decisions[(candidate.ce_strike, candidate.pe_strike)] = {
+                        "result": "FAIL", "reason": "OTM_RESEARCH_MINIMUM_ASK"
+                    }
+                    continue
             
             premium_ratio = max(ce_price, pe_price) / min(ce_price, pe_price)
             if premium_ratio > config.maximum_pair_premium_ratio:
@@ -82,6 +121,7 @@ class PairRanker:
                 continue
             ce_bid = ce_data.get("bid", ce_price)
             pe_bid = pe_data.get("bid", pe_price)
+            minimum_net, minimum_return = self.economic_thresholds(candidate, regime, config)
             projected = ProfitabilityCalculator.calculate(ProfitabilityInput(
                 entry_ce_ask=ce_price,
                 entry_pe_ask=pe_price,
@@ -91,8 +131,8 @@ class PairRanker:
                 lot_size=contract_lot_size,
                 freeze_units=config.max_units_per_leg,
                 slippage_per_unit_per_fill=config.projected_slippage_per_unit_per_fill,
-                minimum_net_profit=config.minimum_projected_net_profit,
-                minimum_return_pct=config.minimum_projected_return_pct,
+                minimum_net_profit=minimum_net,
+                minimum_return_pct=minimum_return,
             ))
             projected_net_profit = projected.projected_net_pnl
             if not projected.buffer_passed:

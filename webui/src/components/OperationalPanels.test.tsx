@@ -87,13 +87,15 @@ describe("operational dashboard panels", () => {
     const onAdjust = vi.fn();
     render(<CapitalPanel onAdjust={onAdjust} engineRunning={false} capital={{
       mode: "PAPER", base_capital: 45000, realized_pnl: -1000, cash_adjustments: 6000,
+      today_realized_pnl: 0, month_realized_pnl: -1000,
       equity: 50000, live_allocation: null, read_only: true,
       transactions: [{ id: "tx", timestamp: "2026-07-15T10:00:00", mode: "PAPER", type: "DEPOSIT", amount: 6000, note: "Test refill", reference_id: null, broker_balance: null, allocation_after: null }]
     }} />);
     expect(screen.getByText("₹50,000.00")).toBeInTheDocument();
     expect(screen.getByText("Test refill")).toBeInTheDocument();
     expect(screen.getByText("Available PAPER Money")).toBeInTheDocument();
-    expect(screen.getByText("PAPER Trading P&L")).toBeInTheDocument();
+    expect(screen.getByText("Today PAPER P&L")).toBeInTheDocument();
+    expect(screen.getByText("Month PAPER P&L")).toBeInTheDocument();
     expect(screen.getByText("Net Deposits / Withdrawals")).toBeInTheDocument();
     expect(screen.queryByText("Base capital")).not.toBeInTheDocument();
     expect(screen.queryByText("Read only")).not.toBeInTheDocument();

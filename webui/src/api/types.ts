@@ -55,6 +55,7 @@ export interface CapitalTransaction {
 
 export interface CapitalSnapshot {
   mode: "PAPER" | "LIVE"; base_capital: number | null; realized_pnl: number | null;
+  today_realized_pnl?: number | null; month_realized_pnl?: number | null;
   cash_adjustments: number | null; equity: number | null; live_allocation: number | null;
   transactions: CapitalTransaction[]; read_only: boolean;
 }

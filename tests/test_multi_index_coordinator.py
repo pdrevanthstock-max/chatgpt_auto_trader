@@ -35,6 +35,7 @@ def test_coordinator_selects_one_best_tradable_candidate_and_records_all_diagnos
 
     assert outcome.executed is True
     assert outcome.index_symbol == "BANKNIFTY"
+    assert outcome.reason == "QUEUED"
     assert executed == [("BANKNIFTY", Candidate("b", 300, 75))]
     assert [row.index_symbol for row in captured] == ["NIFTY", "BANKNIFTY", "MIDCPNIFTY"]
 

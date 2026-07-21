@@ -89,7 +89,9 @@ class MultiIndexCoordinator:
             if not self._reservation.activate(token):
                 self._reservation.release(token)
                 return CoordinationOutcome(False, symbol, "RESERVATION_ACTIVATION_FAILED")
-            return CoordinationOutcome(True, symbol, "EXECUTED")
+            # The callback accepted the candidate for serialized execution; a
+            # broker/PAPER fill has not happened yet.
+            return CoordinationOutcome(True, symbol, "QUEUED")
         except Exception:
             self._reservation.release(token)
             raise

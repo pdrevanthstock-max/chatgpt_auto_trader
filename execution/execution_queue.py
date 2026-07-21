@@ -28,7 +28,11 @@ class ExecutionQueue:
             except queue.Empty:
                 break
 
-    def process_pending_sync(self, executor_callback: Callable[[ExecutionSignal], None]) -> None:
+    def process_pending_sync(
+        self,
+        executor_callback: Callable[[ExecutionSignal], None],
+        on_error: Optional[Callable[[ExecutionSignal, Exception], None]] = None,
+    ) -> None:
         """Processes all currently pending signals synchronously (useful for backtesting)."""
         while not self._queue.empty():
             try:
@@ -40,15 +44,22 @@ class ExecutionQueue:
                 break
             except Exception as e:
                 logger.error(f"Error processing sync queue signal: {e}")
+                if on_error is not None:
+                    on_error(signal, e)
+                self._queue.task_done()
 
-    def start_background_worker(self, executor_callback: Callable[[ExecutionSignal], None]) -> None:
+    def start_background_worker(
+        self,
+        executor_callback: Callable[[ExecutionSignal], None],
+        on_error: Optional[Callable[[ExecutionSignal, Exception], None]] = None,
+    ) -> None:
         """Starts a background thread to process signals in live/paper trading."""
         if self._running:
             return
         self._running = True
         self._thread = threading.Thread(
             target=self._worker_loop,
-            args=(executor_callback,),
+            args=(executor_callback, on_error),
             daemon=True
         )
         self._thread.start()
@@ -60,7 +71,11 @@ class ExecutionQueue:
             self._thread.join(timeout=2.0)
         logger.info("ExecutionQueue: Background worker thread stopped.")
 
-    def _worker_loop(self, executor_callback: Callable[[ExecutionSignal], None]) -> None:
+    def _worker_loop(
+        self,
+        executor_callback: Callable[[ExecutionSignal], None],
+        on_error: Optional[Callable[[ExecutionSignal, Exception], None]],
+    ) -> None:
         while self._running:
             try:
                 # Block for up to 1 second waiting for a signal
@@ -68,9 +83,14 @@ class ExecutionQueue:
                 logger.info(f"ExecutionQueue [ASYNC]: Dequeued signal {signal.type.value}")
                 
                 # Execute the signal handler
-                executor_callback(signal)
-                
-                self._queue.task_done()
+                try:
+                    executor_callback(signal)
+                except Exception as exc:
+                    logger.error(f"Error executing queued signal: {exc}")
+                    if on_error is not None:
+                        on_error(signal, exc)
+                finally:
+                    self._queue.task_done()
             except queue.Empty:
                 continue
             except Exception as e:

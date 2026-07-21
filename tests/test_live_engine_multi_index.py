@@ -63,14 +63,11 @@ def test_paper_strategy_equity_uses_the_dashboard_authoritative_balance():
         execution_mode=ExecutionMode.PAPER.value,
         total_capital=45_000.0,
     )
-    engine.session_allocated_capital = 8_634.65
-    engine.realized_pnl = -122.03
-    engine.capital_ledger = SimpleNamespace(
-        paper_equity=lambda **_: 44_877.97,
-    )
-    engine.paper_equity_provider = lambda: 81_243.32
+    engine.session_allocated_capital = 45_000.0
+    engine.realized_pnl = -37_987.09
+    engine.paper_equity_provider = lambda: 43_378.26
 
-    assert engine.current_strategy_equity() == 81_243.32
+    assert engine.current_strategy_equity() == 43_378.26
 
 
 def test_active_trade_uses_its_own_market_cache_and_paper_executor():
@@ -103,6 +100,38 @@ def test_failed_paper_entry_releases_the_global_position_slot():
 
     assert engine.position_reservation.snapshot().state == "EMPTY"
     assert engine._position_reservation_token is None
+
+
+def test_post_fill_entry_failure_retains_reservation_and_reports_uncertain_state():
+    engine = LiveEngine.__new__(LiveEngine)
+    engine.session_execution_mode = ExecutionMode.PAPER.value
+    engine.config = SimpleNamespace(execution_mode=ExecutionMode.PAPER.value)
+    engine.position_reservation = PositionReservation()
+    token = engine.position_reservation.try_reserve("NIFTY:candidate")
+    assert token is not None
+    assert engine.position_reservation.activate(token)
+    engine._position_reservation_token = token
+    engine.active_trade = Trade(
+        execution_mode=ExecutionMode.PAPER.value,
+        index_symbol="NIFTY",
+        strike_ce=24_100,
+        strike_pe=24_150,
+        entry_ce_price=100.0,
+        entry_pe_price=100.0,
+        quantity=1,
+        lot_size=65,
+    )
+    messages = []
+    engine.log_activity = messages.append
+
+    engine._handle_execution_failure(
+        ExecutionSignal(type=SignalType.ENTRY, reservation_token=token),
+        RuntimeError("database persistence failed"),
+    )
+
+    assert engine.position_reservation.snapshot().state == "ACTIVE"
+    assert "reservation retained" in messages[-1].lower()
+    assert "reconcile" in messages[-1].lower()
 
 
 def test_successful_paper_exit_releases_global_slot_for_next_entry():

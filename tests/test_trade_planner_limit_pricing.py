@@ -19,7 +19,7 @@ def _candidate() -> ScoredCandidate:
     )
 
 
-def test_sideways_plan_places_each_buy_limit_at_top_of_book_midpoint():
+def test_paper_sideways_plan_uses_current_ask_as_marketable_limit():
     plan = TradePlanner().plan_trade(
         candidate=_candidate(),
         regime=MarketRegime.SIDEWAYS,
@@ -29,6 +29,23 @@ def test_sideways_plan_places_each_buy_limit_at_top_of_book_midpoint():
         ce_bid=99.0,
         pe_bid=198.0,
         config=TradingConfig(execution_mode="PAPER"),
+    )
+
+    assert plan.order_type == OrderType.LIMIT
+    assert plan.ce_limit_price == 102.00
+    assert plan.pe_limit_price == 202.00
+
+
+def test_live_sideways_plan_retains_midpoint_limit_pricing():
+    plan = TradePlanner().plan_trade(
+        candidate=_candidate(),
+        regime=MarketRegime.SIDEWAYS,
+        quantity=1,
+        ce_price=102.0,
+        pe_price=202.0,
+        ce_bid=99.0,
+        pe_bid=198.0,
+        config=TradingConfig(execution_mode="LIVE"),
     )
 
     assert plan.order_type == OrderType.LIMIT

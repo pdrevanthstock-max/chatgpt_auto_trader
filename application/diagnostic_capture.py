@@ -102,7 +102,10 @@ class DiagnosticCaptureService:
                     int(row["__capture_sequence"]),
                 ),
             )
-            visible.extend(ranked[: self._top_count])
+            # The API always exposes enough rows for the UI's Top 5/Top 10
+            # toggle. ``top_count`` remains the user's initial display choice;
+            # truncating here made Top 10 impossible without restarting capture.
+            visible.extend(ranked[:10])
         return visible
 
     def _snapshot_unlocked(self) -> DiagnosticSnapshot:

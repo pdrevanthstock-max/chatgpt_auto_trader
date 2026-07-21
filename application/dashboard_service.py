@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Callable
 
+from application.paper_account import PaperAccountService
 from application.performance_service import PerformancePeriod, PerformanceService
 from config.settings import TradingConfig
 from database.capital_ledger import CapitalLedger, CapitalTransactionType
@@ -19,12 +20,20 @@ class DashboardService:
         config: TradingConfig,
         now_provider: Callable[[], datetime],
         active_trade_provider: Callable[[], object | None] | None = None,
+        paper_lifetime_pnl_provider: Callable[[], float] | None = None,
     ) -> None:
         self._trade_store = trade_store
         self._capital_ledger = capital_ledger
         self._config = config
         self._now = now_provider
         self._active_trade_provider = active_trade_provider or (lambda: None)
+        self._paper_lifetime_pnl_provider = paper_lifetime_pnl_provider
+        self._paper_account = PaperAccountService(
+            config=config,
+            capital_ledger=capital_ledger,
+            trade_store=trade_store,
+            now_provider=now_provider,
+        )
 
     @staticmethod
     def _mode(value: str) -> str:
@@ -192,13 +201,20 @@ class DashboardService:
             and str(item.reference_id or "") not in represented_trade_ids
         )
         realized = round(realized + orphaned_ledger_pnl, 2)
-        adjustments = self._capital_ledger.cash_adjustment_total(normalized)
+        recovery_realized = realized
+        if self._paper_lifetime_pnl_provider is not None:
+            recovery_realized = round(float(self._paper_lifetime_pnl_provider()), 2)
+        account = self._paper_account.snapshot(
+            lifetime_realized_pnl=recovery_realized
+        )
         return {
             "mode": normalized,
             "base_capital": float(self._config.total_capital),
-            "realized_pnl": realized,
-            "cash_adjustments": adjustments,
-            "equity": self._capital_ledger.paper_equity(self._config.total_capital, realized),
+            "realized_pnl": account.lifetime_realized_pnl,
+            "cash_adjustments": account.cash_adjustments,
+            "equity": account.available_equity,
+            "today_realized_pnl": account.today_realized_pnl,
+            "month_realized_pnl": account.month_realized_pnl,
             "live_allocation": None,
             "transactions": rows,
             "read_only": True,

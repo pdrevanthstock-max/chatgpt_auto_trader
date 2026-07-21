@@ -42,6 +42,18 @@ def _moneyness(strike: object, option_type: str, atm: int, step: int) -> str:
     return f"{option_type}_{'ITM' if is_itm else 'OTM'}{distance}"
 
 
+def _non_positive_velocity_reason(ce_velocity: float, pe_velocity: float) -> str:
+    if ce_velocity < 0.0 and pe_velocity < 0.0:
+        return "TRUE_DUAL_DECAY"
+    if ce_velocity == 0.0 and pe_velocity == 0.0:
+        return "FLAT_NO_MOMENTUM"
+    if ce_velocity < 0.0 and pe_velocity == 0.0:
+        return "CE_DECAY_PE_FLAT"
+    if ce_velocity == 0.0 and pe_velocity < 0.0:
+        return "CE_FLAT_PE_DECAY"
+    return "NON_POSITIVE_MOMENTUM"
+
+
 def build_scan_diagnostics(
     *,
     scanned: Iterable[CandidatePair],
@@ -91,7 +103,9 @@ def build_scan_diagnostics(
         if key not in survivor_keys:
             result = "FAIL"
             if candidate.ce_velocity <= 0.0 and candidate.pe_velocity <= 0.0:
-                reason = "DUAL_DECAY"
+                reason = _non_positive_velocity_reason(
+                    candidate.ce_velocity, candidate.pe_velocity
+                )
             elif not (lower <= candidate.divergence <= upper):
                 reason = f"DIVERGENCE_OUTSIDE_{lower:g}_TO_{upper:g}"
             elif (

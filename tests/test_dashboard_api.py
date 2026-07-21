@@ -97,6 +97,8 @@ def test_paper_capital_endpoint_separates_equity_from_ledger_adjustments(tmp_pat
 
     assert body["base_capital"] == 45_000.0
     assert body["equity"] == 50_000.0
+    assert body["today_realized_pnl"] == closed.net_pnl
+    assert body["month_realized_pnl"] == closed.net_pnl
     assert body["cash_adjustments"] == round(5_000.0 - closed.net_pnl, 2)
     assert body["transactions"][0]["note"] == "Test refill"
 

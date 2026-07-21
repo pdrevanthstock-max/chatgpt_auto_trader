@@ -24,6 +24,7 @@ from backtest.engine import BacktestEngine
 from backtest.results import BacktestResults
 from database.trade_store import TradeStore
 from database.capital_ledger import CapitalLedger
+from application.paper_account import PaperAccountService
 from application.performance_service import PerformancePeriod, PerformanceService
 from application.activity_journal import ActivityJournal
 from application.market_session import MarketPhase, MarketSessionSchedule
@@ -162,6 +163,15 @@ class LiveEngine:
         self.health_monitor = HealthMonitor()
         self.store = TradeStore()
         self.capital_ledger = CapitalLedger()
+        self.paper_account = PaperAccountService(
+            config=self.config,
+            capital_ledger=self.capital_ledger,
+            trade_store=self.store,
+            now_provider=datetime.now,
+        )
+        self.paper_equity_provider = lambda: self.paper_account.snapshot(
+            lifetime_realized_pnl=self.realized_pnl,
+        ).available_equity
         
         # Real-time state
         self.realized_pnl, self.active_trade = self.recovery.load_state(
@@ -297,10 +307,10 @@ class LiveEngine:
         )
         mode = self.session_execution_mode or self.config.execution_mode
         if mode == ExecutionMode.PAPER.value:
-            return self.capital_ledger.paper_equity(
-                base_capital=base_capital,
-                realized_net_pnl=self.realized_pnl,
-            )
+            provider = getattr(self, "paper_equity_provider", None)
+            if provider is not None:
+                return float(provider())
+            return self.capital_ledger.paper_equity(base_capital, self.realized_pnl)
         return max(0.0, round(base_capital + self.realized_pnl, 2))
 
     def start(self) -> None:
@@ -312,6 +322,12 @@ class LiveEngine:
             self.config.execution_mode = self.execution_mode_lock
         self.session_execution_mode = self.config.execution_mode
         self.session_allocated_capital = self.config.total_capital
+        self.paper_account = PaperAccountService(
+            config=self.config,
+            capital_ledger=self.capital_ledger,
+            trade_store=self.store,
+            now_provider=datetime.now,
+        )
         if (
             self.session_execution_mode == ExecutionMode.LIVE.value
             and not self.config.live_trading_enabled
@@ -436,7 +452,10 @@ class LiveEngine:
         self.log_activity("Live market-data feed initialization requested.")
         
         self.queue.clear()
-        self.queue.start_background_worker(self._execute_signal)
+        self.queue.start_background_worker(
+            self._execute_signal,
+            on_error=self._handle_execution_failure,
+        )
         
         while self.running:
             try:
@@ -730,6 +749,28 @@ class LiveEngine:
                     f"{winner.index_symbol}"
                 ),
             ))
+
+    def _handle_execution_failure(
+        self, signal: ExecutionSignal, error: Exception
+    ) -> None:
+        if signal.type == SignalType.ENTRY:
+            execution_mode = self.session_execution_mode or self.config.execution_mode
+            position_may_exist = bool(
+                self.active_trade is not None and self.active_trade.is_open
+            ) or execution_mode == ExecutionMode.LIVE.value
+            if position_may_exist:
+                summary = " ".join(str(error).split())[:300] or error.__class__.__name__
+                self.log_activity(
+                    "ENTRY POST-FILL STATE UNCERTAIN: "
+                    f"{summary}. Position reservation retained; reconcile the "
+                    "tracked/broker position before any new entry."
+                )
+                return
+            self._release_reservation(signal.reservation_token)
+        summary = " ".join(str(error).split())[:300] or error.__class__.__name__
+        self.log_activity(
+            f"{signal.type.value} FAILED: {summary}. No position was recorded."
+        )
 
     def _execute_signal(self, signal: ExecutionSignal) -> None:
         now = datetime.now()

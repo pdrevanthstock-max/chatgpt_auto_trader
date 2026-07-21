@@ -20,7 +20,7 @@ def test_scan_diagnostics_explains_dual_decay_band_direction_and_profitability()
     )
 
     by_strike = {row["ce_strike"]: row for row in rows}
-    assert by_strike[24000]["reason"] == "DUAL_DECAY"
+    assert by_strike[24000]["reason"] == "TRUE_DUAL_DECAY"
     assert by_strike[24050]["reason"] == "DIVERGENCE_OUTSIDE_0.75_TO_6"
     assert by_strike[24100]["reason"] == "PROJECTED_NET_BUFFER_FAILED"
     assert by_strike[24100]["projected_net"] == -20.0
@@ -87,3 +87,25 @@ def test_scan_diagnostics_classifies_both_otm_from_spot_without_atm_metadata():
     )
 
     assert rows[0]["pair_class"] == "OTM_RESEARCH"
+
+
+def test_scan_diagnostics_distinguishes_flat_quotes_from_true_dual_decay():
+    cases = [
+        (CandidatePair(24000, 24000, 0.0, 0.0, 0.0, "CE"), "FLAT_NO_MOMENTUM"),
+        (CandidatePair(24050, 24050, -1.0, 0.0, 1.0, "PE"), "CE_DECAY_PE_FLAT"),
+        (CandidatePair(24100, 24100, 0.0, -1.0, 1.0, "CE"), "CE_FLAT_PE_DECAY"),
+        (CandidatePair(24150, 24150, -1.0, -2.0, 1.0, "CE"), "TRUE_DUAL_DECAY"),
+    ]
+
+    rows = build_scan_diagnostics(
+        scanned=[candidate for candidate, _ in cases],
+        survivors=[],
+        ranker_decisions={},
+        regime=MarketRegime.SIDEWAYS,
+        spot_trend="SIDEWAYS",
+        config=TradingConfig(),
+        index_symbol="NIFTY",
+    )
+
+    reasons = {row["ce_strike"]: row["reason"] for row in rows}
+    assert reasons == {candidate.ce_strike: expected for candidate, expected in cases}

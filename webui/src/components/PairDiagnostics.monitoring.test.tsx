@@ -78,4 +78,23 @@ describe("PairDiagnostics strategy monitoring", () => {
     rerender(<PairDiagnostics diagnostics={{ capturing: false, top_count: 5, rows: [] }} onStart={vi.fn()} onStop={vi.fn()} />);
     expect(screen.getByText(/No captured scan rows/i)).toBeInTheDocument();
   });
+
+  it("switches an existing capture between five and ten visible pairs", async () => {
+    const diagnostics: DiagnosticSnapshot = {
+      capturing: true,
+      top_count: 5,
+      rows: Array.from({ length: 10 }, (_, index) =>
+        row("NIFTY", `pair-${index + 1}`, 300 - index, index + 1),
+      ),
+    };
+    render(<PairDiagnostics diagnostics={diagnostics} onStart={vi.fn()} onStop={vi.fn()} />);
+
+    const table = screen.getByRole("table", { name: /NIFTY Top pairs/i });
+    expect(within(table).getAllByRole("row")).toHaveLength(6);
+
+    await userEvent.click(screen.getByRole("button", { name: "Top 10" }));
+
+    expect(within(table).getAllByRole("row")).toHaveLength(11);
+    expect(within(table).getByText("pair-10")).toBeInTheDocument();
+  });
 });

@@ -57,8 +57,8 @@ def test_top_n_is_retained_per_index_and_cycle_regardless_of_scan_order():
         symbol: sorted(row["rank"] for row in visible if row["index"] == symbol)
         for symbol in ("NIFTY", "BANKNIFTY")
     } == {
-        "NIFTY": [1, 2, 3, 4, 5],
-        "BANKNIFTY": [1, 2, 3, 4, 5],
+        "NIFTY": [1, 2, 3, 4, 5, 6],
+        "BANKNIFTY": [1, 2, 3, 4, 5, 6],
     }
     assert len(json.loads(capture.to_json())) == 12
 
@@ -116,3 +116,17 @@ def test_latest_cycle_prefers_ranked_pairs_over_wait_record():
     ])
 
     assert [row.get("rank") for row in capture.snapshot().rows] == [1, 2]
+
+
+def test_live_snapshot_exposes_ten_rows_even_when_capture_started_at_top_five():
+    capture = DiagnosticCaptureService(max_rows=100)
+    capture.start(5)
+    capture.record([
+        {"cycle_id": "c1", "index": "NIFTY", "rank": rank, "pair": f"pair-{rank}"}
+        for rank in range(1, 11)
+    ])
+
+    snapshot = capture.snapshot()
+
+    assert snapshot.top_count == 5
+    assert [row["rank"] for row in snapshot.rows] == list(range(1, 11))

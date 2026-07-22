@@ -44,8 +44,15 @@ class TradePlanner:
                 raise ValueError(
                     "SIDEWAYS limit pricing requires positive, non-inverted CE/PE bids and asks."
                 )
-            ce_limit = round((float(ce_bid) + float(ce_price)) / 2.0, 2)
-            pe_limit = round((float(pe_bid) + float(pe_price)) / 2.0, 2)
+            if str(config.execution_mode).upper() == "PAPER":
+                # PAPER has no resting exchange order to receive a later fill.
+                # Use the observed ask as a capped, marketable limit so the
+                # simulator remains executable without pretending a market fill.
+                ce_limit = round(float(ce_price), 2)
+                pe_limit = round(float(pe_price), 2)
+            else:
+                ce_limit = round((float(ce_bid) + float(ce_price)) / 2.0, 2)
+                pe_limit = round((float(pe_bid) + float(pe_price)) / 2.0, 2)
 
         plan = TradePlan(
             scored_candidate=candidate,

@@ -62,6 +62,15 @@ def test_feed_maps_all_five_indices_and_builds_one_bounded_quote_request(
     request = feed._build_quote_request()
 
     assert request["IDX_I"] == [13, 25, 27, 38, 442]
-    assert len(request["NSE_FNO"]) == 50
+    assert len(request["NSE_FNO"]) == 70
+    for symbol in registry.symbols:
+        spec = registry.get(symbol)
+        cache_spot, _ = caches.get(symbol).get_spot()
+        atm = int(round(cache_spot / spec.strike_step) * spec.strike_step)
+        mapping = feed.strike_maps[symbol]
+        assert mapping[(float(atm + spec.strike_step), "CE")] in request["NSE_FNO"]
+        assert mapping[(float(atm + 2 * spec.strike_step), "CE")] in request["NSE_FNO"]
+        assert mapping[(float(atm - spec.strike_step), "PE")] in request["NSE_FNO"]
+        assert mapping[(float(atm - 2 * spec.strike_step), "PE")] in request["NSE_FNO"]
     assert set(feed.active_expiries) == registry.symbols
     assert all(len(feed.strike_maps[symbol]) == 18 for symbol in registry.symbols)

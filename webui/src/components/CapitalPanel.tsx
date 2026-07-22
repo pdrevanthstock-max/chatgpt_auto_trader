@@ -20,7 +20,7 @@ export function CapitalPanel({
   const available = Number(capital.equity ?? 0);
   const [mode, setMode] = useState<AdjustmentMode>("deposit");
   const [amountText, setAmountText] = useState("");
-  const [note, setNote] = useState("");
+  const [note, setNote] = useState("PAPER test money adjustment");
   useEffect(() => setAmountText(""), [capital.equity]);
   const amount = Number(amountText);
   const signedAmount = mode === "deposit" ? amount : -amount;
@@ -45,7 +45,8 @@ export function CapitalPanel({
     <div className="panel-heading"><div><p className="eyebrow">Simulated capital</p><h2 id="capital-title">PAPER money &amp; ledger</h2><p className="panel-subtitle">Local test money only. Deposits and withdrawals never touch Dhan or real funds.</p></div><span className="paper-lock">PAPER only</span></div>
     <div className="metric-grid">
       <div><span>Available PAPER Money</span><strong>{currency(available)}</strong></div>
-      <div><span>PAPER Trading P&amp;L</span><strong className={(capital.realized_pnl ?? 0) < 0 ? "negative" : "positive"}>{currency(capital.realized_pnl)}</strong></div>
+      <div><span>Today PAPER P&amp;L</span><strong className={(capital.today_realized_pnl ?? 0) < 0 ? "negative" : "positive"}>{currency(capital.today_realized_pnl ?? 0)}</strong></div>
+      <div><span>Month PAPER P&amp;L</span><strong className={(capital.month_realized_pnl ?? 0) < 0 ? "negative" : "positive"}>{currency(capital.month_realized_pnl ?? 0)}</strong></div>
       <div><span>Net Deposits / Withdrawals</span><strong>{currency(capital.cash_adjustments)}</strong></div>
     </div>
     <div className="capital-adjustment">
@@ -54,7 +55,7 @@ export function CapitalPanel({
         <button className={mode === "withdraw" ? "selected" : ""} onClick={() => setMode("withdraw")}>Withdraw</button>
       </div>
       <div className="capital-form">
-        <label>Amount (₹)<input aria-label="Amount" type="number" min="0.01" step="0.01" disabled={locked} value={amountText} onChange={event => setAmountText(event.target.value)} /></label>
+        <label>Amount (₹)<input aria-label="Amount" type="text" inputMode="decimal" disabled={locked} value={amountText} onChange={event => setAmountText(event.target.value)} placeholder="Example: 5000" /></label>
         <label>Audit note<input aria-label="Audit note" disabled={locked} value={note} onChange={event => setNote(event.target.value)} placeholder="Why are you changing PAPER money?" /></label>
         <button className="primary" disabled={Boolean(validation) || !onAdjust} onClick={submit}>Apply PAPER {mode}</button>
       </div>

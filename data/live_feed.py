@@ -215,6 +215,11 @@ class LiveFeed:
             atm = int(round(spot / spec.strike_step) * spec.strike_step)
             ce_strikes = [atm - offset * spec.strike_step for offset in range(5)]
             pe_strikes = [atm + offset * spec.strike_step for offset in range(5)]
+            # OTM1/OTM2 are quoted for guarded PAPER research and diagnostics.
+            # Candidate policy still decides whether they may be considered;
+            # adding quotes alone cannot make them executable.
+            ce_strikes.extend(atm + offset * spec.strike_step for offset in (1, 2))
+            pe_strikes.extend(atm - offset * spec.strike_step for offset in (1, 2))
             if (
                 trade is not None
                 and trade.is_open

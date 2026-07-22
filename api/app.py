@@ -18,6 +18,7 @@ from config.settings import TradingConfig
 from core.index_registry import IndexRegistry
 from database.capital_ledger import CapitalLedger
 from database.trade_store import TradeStore
+from execution.crash_recovery import CrashRecovery
 
 
 def _selection_view(snapshot: IndexSelectionSnapshot) -> IndexSelectionView:
@@ -38,6 +39,7 @@ def create_app(
     diagnostics: DiagnosticCaptureService | None = None,
     now_provider: Callable[[], datetime] | None = None,
     runtime: RuntimeService | None = None,
+    paper_lifetime_pnl_provider: Callable[[], float] | None = None,
 ) -> FastAPI:
     registry = IndexRegistry.default()
     selection = IndexSelectionService(registry)
@@ -45,6 +47,12 @@ def create_app(
     runtime_service = runtime or RuntimeService(
         production_paper_engine_factory(diagnostic_capture, selection)
     )
+    if paper_lifetime_pnl_provider is None and trade_store is None and capital_ledger is None:
+        def paper_lifetime_pnl_provider() -> float:
+            engine = runtime_service.engine
+            if engine is not None:
+                return float(getattr(engine, "realized_pnl", 0.0))
+            return float(CrashRecovery().load_state(execution_mode="PAPER")[0])
     dashboard = DashboardService(
         trade_store=trade_store or TradeStore(),
         capital_ledger=capital_ledger or CapitalLedger(),
@@ -55,6 +63,7 @@ def create_app(
             if runtime_service.engine is not None
             else None
         ),
+        paper_lifetime_pnl_provider=paper_lifetime_pnl_provider,
     )
     app = FastAPI(title="AutoTrader Control API", version="0.1.0")
     app.add_middleware(

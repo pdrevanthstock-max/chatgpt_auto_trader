@@ -52,7 +52,7 @@ function CapitalCards({ row, index }: { row: Row; index: string }) {
     ["Spot", rowNumber(row, "spot", "spot_price")?.toLocaleString("en-IN") ?? "—"],
     ["ATM", text(row, "atm", "atm_strike") || "—"], ["Expiry", text(row, "expiry", "expiry_date") || "—"],
     ["Lot size", text(row, "lot_size") || "—"], ["Combined premium", money(row, "combined_ask", "combined_premium")],
-    ["One-lot cost", money(row, "one_lot_premium", "one_lot_cost")], ["Deployable equity", money(row, "deployable_capital", "deployable_equity")],
+    ["One-lot cost", money(row, "one_lot_premium", "one_lot_cost")], ["Available after 10% safety reserve", money(row, "deployable_capital", "deployable_equity")],
     ["Affordable lots", maxLots(row)], ["Charges", money(row, "charges_estimate", "estimated_charges")],
     ["Shortfall", money(row, "capital_shortfall", "shortfall")], ["Premium at risk", money(row, "maximum_premium_at_risk", "premium_at_risk")],
     ["Quote age", seconds(rowNumber(row, "quote_age_seconds", "quote_age"))],
@@ -129,7 +129,7 @@ export function PairDiagnostics({ diagnostics, onStart, onStop }: Props) {
     <div className="toolbar"><label>Capture Top <select value={captureTop} disabled={diagnostics.capturing} onChange={event => setCaptureTop(Number(event.target.value) as 5 | 10)}><option value={5}>5</option><option value={10}>10</option></select></label>{!diagnostics.capturing ? <button className="primary" onClick={() => onStart(captureTop)}>Start capture</button> : <button className="danger" onClick={onStop}>Stop capture</button>}<a className="button-link" href="/api/diagnostics/download?format=csv">CSV</a><a className="button-link" href="/api/diagnostics/download?format=json">JSON</a></div>
     {diagnostics.rows.length === 0 ? <p className="empty-state">No captured scan rows. Start capture to collect subsequent completed-candle scans.</p> : <>
       <GlobalComparison rows={Object.values(rowsByIndex).flat()} />
-      <div className="index-tabs" role="tablist" aria-label="Index pair rankings">{indices.map((index, position) => <button key={index} ref={element => { tabs.current[position] = element; }} role="tab" id={`tab-${index}`} aria-controls={`panel-${index}`} aria-selected={selected === index} tabIndex={selected === index ? 0 : -1} onKeyDown={event => selectByArrow(event, position)} onClick={() => setSelected(index)}>{index}<small>{independentRanking(rowsByIndex[index], diagnostics.top_count).length} pairs</small></button>)}</div>
+      <div className="index-tabs" role="tablist" aria-label="Index pair rankings">{indices.map((index, position) => <button key={index} ref={element => { tabs.current[position] = element; }} role="tab" id={`tab-${index}`} aria-controls={`panel-${index}`} aria-selected={selected === index} tabIndex={selected === index ? 0 : -1} onKeyDown={event => selectByArrow(event, position)} onClick={() => setSelected(index)}>{index}<small>{independentRanking(rowsByIndex[index], 10).length} pairs</small></button>)}</div>
       <div role="tabpanel" id={`panel-${selected}`} aria-labelledby={`tab-${selected}`} className="index-workspace">
         <div className="monitoring-split"><CapitalCards row={best} index={selected} /><RejectionFunnel row={best} /></div>
         <StrikeUniverse row={best} />
